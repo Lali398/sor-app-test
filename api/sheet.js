@@ -44,6 +44,24 @@ const transformRowToBeer = (row, userIndexes, ratedBy) => {
     };
 };
 
+// === GOOGLE SERVICE ACCOUNT KULCS NORMALIZÁLÁSA ===
+// A Vercel felületére bemásolt privát kulcs jellemzően háromféleképpen romlik el:
+//   1. idézőjelekkel együtt kerül be az értékbe,
+//   2. a sortörések "\n" szekvenciaként maradnak benne (ez a várt eset),
+//   3. JSON-ból másolva "\\n" lesz belőlük.
+// Mindhármat ugyanarra a valódi PEM formára hozzuk.
+const normalizePrivateKey = (raw) => {
+    if (!raw) return '';
+    let key = String(raw).trim();
+    if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+        key = key.slice(1, -1);
+    }
+    return key.replace(/\\\\n/g, '\n').replace(/\\n/g, '\n').trim();
+};
+
+const isPemPrivateKey = (key) => /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(key)
+    && /-----END [A-Z ]*PRIVATE KEY-----/.test(key);
+
 const verifyUser = (req) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -233,13 +251,110 @@ export default async function handler(req, res) {
     const { action } = req.body;
     const { SPREADSHEET_ID, GOOGLE_PRIVATE_KEY, GOOGLE_CLIENT_EMAIL, JWT_SECRET } = process.env;
 
-    if (!SPREADSHEET_ID || !GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY || !JWT_SECRET) {
-        return res.status(500).json({ error: "Szerveroldali konfigurációs hiba." });
+    // === A GOOGLE CLIENT ID KIADÁSA A FRONTENDNEK ===
+    // A Client ID publikus adat (minden oldal forrásában benne van), viszont így
+    // deploymentenként a Vercel env változó dönti el, melyik OAuth klienst használjuk,
+    // nem pedig egy kódba égetett érték. A config-ellenőrzés előtt fut, mert
+    // csak a GOOGLE_CLIENT_ID kell hozzá.
+    if (action === 'GET_PUBLIC_CONFIG') {
+        return res.status(200).json({ googleClientId: process.env.GOOGLE_CLIENT_ID || null });
+    }
+
+    // === DIAGNOSZTIKA ===
+    // Szándékosan a config-ellenőrzés ELŐTT fut, hogy pont akkor is használható legyen,
+    // amikor a környezeti változók hiányoznak (pl. frissen létrehozott Vercel projektnél).
+    // Titkot nem ad vissza: csak azt, hogy egy változó be van-e állítva, illetve hogy a
+    // service account tényleg eléri-e a táblázatot. A service account e-mail és a
+    // spreadsheet ID csak helyes ADMIN_PIN mellett kerül bele.
+    if (action === 'HEALTH_CHECK') {
+        const normalizedKey = normalizePrivateKey(GOOGLE_PRIVATE_KEY);
+        const isAdmin = !!process.env.ADMIN_PIN
+            && String(req.body.pin || '').trim() === String(process.env.ADMIN_PIN).trim();
+
+        const report = {
+            env: {
+                SPREADSHEET_ID: !!SPREADSHEET_ID,
+                GOOGLE_CLIENT_EMAIL: !!GOOGLE_CLIENT_EMAIL,
+                GOOGLE_PRIVATE_KEY: !!GOOGLE_PRIVATE_KEY,
+                JWT_SECRET: !!JWT_SECRET,
+                GOOGLE_CLIENT_ID: !!process.env.GOOGLE_CLIENT_ID,
+                ADMIN_PIN: !!process.env.ADMIN_PIN,
+                TWOFA_ENC_KEY: !!process.env.TWOFA_ENC_KEY
+            },
+            privateKey: {
+                looksLikePem: isPemPrivateKey(normalizedKey),
+                hasRealNewlines: normalizedKey.includes('\n'),
+                length: normalizedKey.length
+            },
+            googleClientId: process.env.GOOGLE_CLIENT_ID || null,
+            sheet: { checked: false }
+        };
+
+        // Élő próba: ez mutatja meg, hogy a service accountnak tényleg van-e joga
+        // EHHEZ a táblázathoz, és megvan-e benne a Felhasználók munkalap.
+        if (report.env.SPREADSHEET_ID && report.env.GOOGLE_CLIENT_EMAIL && report.privateKey.looksLikePem) {
+            try {
+                const probeAuth = new google.auth.GoogleAuth({
+                    credentials: { client_email: GOOGLE_CLIENT_EMAIL, private_key: normalizedKey },
+                    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+                });
+                const probeSheets = google.sheets({ version: 'v4', auth: probeAuth });
+                const meta = await probeSheets.spreadsheets.get({
+                    spreadsheetId: SPREADSHEET_ID,
+                    fields: 'sheets.properties.title'
+                });
+                const tabs = (meta.data.sheets || []).map(s => s.properties.title);
+                const hasUsersTab = tabs.includes(USERS_SHEET);
+
+                let userCount = null;
+                if (hasUsersTab) {
+                    const usersProbe = await probeSheets.spreadsheets.values.get({
+                        spreadsheetId: SPREADSHEET_ID,
+                        range: `${USERS_SHEET}!A:B`
+                    });
+                    userCount = (usersProbe.data.values || []).filter(row => row[1]).length;
+                }
+
+                report.sheet = { checked: true, ok: true, hasUsersTab, userCount };
+                if (isAdmin) report.sheet.tabs = tabs;
+            } catch (probeError) {
+                report.sheet = {
+                    checked: true,
+                    ok: false,
+                    status: probeError.code || probeError.status || null,
+                    message: probeError.message
+                };
+            }
+        }
+
+        if (isAdmin) {
+            report.serviceAccount = GOOGLE_CLIENT_EMAIL || null;
+            report.spreadsheetId = SPREADSHEET_ID || null;
+        }
+
+        return res.status(200).json(report);
+    }
+
+    // A hiányzó változó NEVE nem titok, az értéke igen - a nevek kiírása viszont
+    // percekre rövidíti a hibakeresést egy frissen létrehozott Vercel projektnél.
+    const missingEnv = ['SPREADSHEET_ID', 'GOOGLE_CLIENT_EMAIL', 'GOOGLE_PRIVATE_KEY', 'JWT_SECRET']
+        .filter(name => !process.env[name]);
+    if (missingEnv.length > 0) {
+        return res.status(500).json({
+            error: `Szerveroldali konfigurációs hiba: hiányzó környezeti változó (${missingEnv.join(', ')}). Ellenőrizd a Vercel projekt Settings > Environment Variables részét, majd deployolj újra.`
+        });
+    }
+
+    const privateKey = normalizePrivateKey(GOOGLE_PRIVATE_KEY);
+    if (!isPemPrivateKey(privateKey)) {
+        return res.status(500).json({
+            error: "Szerveroldali konfigurációs hiba: a GOOGLE_PRIVATE_KEY nem érvényes PEM kulcs (hiányzik a -----BEGIN PRIVATE KEY----- / -----END PRIVATE KEY----- rész). Másold be újra a service account JSON private_key mezőjét."
+        });
     }
 
     try {
         const auth = new google.auth.GoogleAuth({
-            credentials: { client_email: GOOGLE_CLIENT_EMAIL, private_key: GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') },
+            credentials: { client_email: GOOGLE_CLIENT_EMAIL, private_key: privateKey },
             scopes: ['https://www.googleapis.com/auth/spreadsheets'],
         });
         const sheets = google.sheets({ version: 'v4', auth });
