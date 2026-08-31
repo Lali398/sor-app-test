@@ -975,14 +975,35 @@ async function markIdeaAsDone(index) {
 
 
     // === GOOGLE AUTH KONFIGURÁCIÓ ===
-    // Ide írd be a Google Cloud Console-ból kapott ID-t (ugyanaz, ami a Vercelben van)
-    const GOOGLE_CLIENT_ID = "150385298353-bq6vu49q2rh1lvkbblfa3hf67nun0adl.apps.googleusercontent.com";
+    // Elsődlegesen a szervertől kérjük le a Client ID-t (GOOGLE_CLIENT_ID env változó),
+    // így egy másik Vercel projekt (pl. teszt környezet) sajátot használhat anélkül,
+    // hogy a kódot át kellene írni. Ez a tartalék, ha a szerver nem ad vissza semmit.
+    const GOOGLE_CLIENT_ID_FALLBACK = "150385298353-bq6vu49q2rh1lvkbblfa3hf67nun0adl.apps.googleusercontent.com";
 
-    function initGoogleAuth() {
+    async function getGoogleClientId() {
+        try {
+            const response = await fetch('/api/sheet', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'GET_PUBLIC_CONFIG' })
+            });
+            if (response.ok) {
+                const config = await response.json();
+                if (config.googleClientId) return config.googleClientId;
+            }
+        } catch (error) {
+            console.warn('Nem sikerült lekérni a Google Client ID-t a szervertől:', error);
+        }
+        return GOOGLE_CLIENT_ID_FALLBACK;
+    }
+
+    async function initGoogleAuth() {
         if (typeof google === 'undefined') return;
 
+        const clientId = await getGoogleClientId();
+
         google.accounts.id.initialize({
-            client_id: GOOGLE_CLIENT_ID,
+            client_id: clientId,
             callback: handleGoogleResponse
         });
 
@@ -993,6 +1014,19 @@ async function markIdeaAsDone(index) {
                 loginContainer,
                 { theme: "filled_black", size: "large", width: "250", text: "signin_with" }
             );
+
+            // Ha a Google nem rajzolja ki a gombot, az szinte mindig azt jelenti, hogy
+            // ez a domain nincs felvéve az OAuth kliens "Authorized JavaScript origins"
+            // listájába. A Google csak a saját konzolüzenetét logolja, ezért itt adunk konkrét támpontot.
+            setTimeout(() => {
+                if (loginContainer.childElementCount === 0) {
+                    console.error(
+                        `A Google bejelentkezés gomb nem jelent meg. Valószínű ok: a(z) ${window.location.origin} ` +
+                        `origin nincs engedélyezve a(z) ${clientId} OAuth kliensnél. ` +
+                        'Google Cloud Console > APIs & Services > Credentials > OAuth 2.0 Client ID > Authorized JavaScript origins.'
+                    );
+                }
+            }, 2000);
         }
     }
 
@@ -1073,7 +1107,7 @@ async function markIdeaAsDone(index) {
 
     // Google gomb betöltése az oldal betöltésekor
     window.onload = function() {
-        initGoogleAuth();
+        initGoogleAuth().catch(error => console.error('Google Auth inicializálás sikertelen:', error));
     };
 
     // ======================================================
