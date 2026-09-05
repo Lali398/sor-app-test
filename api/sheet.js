@@ -1,5 +1,15 @@
-// api/sheet.js - Javított verzió
-import { google } from 'googleapis';
+// api/sheet.js — PostgreSQL (Supabase) verzió
+//
+// Ugyanaz a végpont, ugyanazok az action-nevek, ugyanazok a válaszformátumok,
+// mint a Google Sheets-es változatban — ezért a frontend (js.js, beerpong.js)
+// EGYETLEN sora sem változik.
+//
+// Szükséges env-változók a Vercelben:
+//   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY   <- ÚJ
+//   JWT_SECRET, ADMIN_PIN, GOOGLE_CLIENT_ID, TWOFA_ENC_KEY   <- változatlan
+// A GOOGLE_* / SPREADSHEET_ID változókra ennek a fájlnak már nincs szüksége.
+
+import { createClient } from '@supabase/supabase-js';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { authenticator } from 'otplib';
@@ -7,60 +17,29 @@ import QRCode from 'qrcode';
 import { OAuth2Client } from 'google-auth-library';
 import crypto from 'crypto';
 
-// === KONFIGURÁCIÓ ===
-const ADMIN_BEERS_SHEET = "'Sör táblázat'!A4:V";
-const USERS_SHEET = 'Felhasználók'; 
-const GUEST_BEERS_SHEET = 'Vendég Sör Teszt';
-const GUEST_DRINKS_SHEET = 'Vendég ital teszt';
-const IDEAS_SHEET = 'Vendég ötletek';
-const RECOMMENDATIONS_SHEET = 'Vendég sör ajánló';
-const SUPPORT_SHEET = 'Hibajelentések';
-const WINNERS_SHEET = 'Nyertesek';
-const BEERPONG_SHEET = 'Sörpong';
-
-const COL_INDEXES = {
-  admin1: { beerName: 0, location: 1, type: 2, look: 3, smell: 4, taste: 5, score: 6, avg: 7, beerPercentage: 8, date: 9 },
-  admin2: { beerName: 12, location: 13, type: 14, look: 15, smell: 16, taste: 17, score: 18, avg: 19, beerPercentage: 20, date: 21 }
+// === ADATBÁZIS KAPCSOLAT ===
+// A service_role kulcs megkerüli az RLS-t. Ez a fájl kizárólag szerveroldalon fut.
+let _db = null;
+const db = () => {
+    if (!_db) {
+        _db = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+            auth: { persistSession: false, autoRefreshToken: false }
+        });
+    }
+    return _db;
 };
+
+// Supabase hibából dobunk kivételt, hogy a handler catch-e egységesen kezelje.
+const must = (res) => {
+    if (res.error) throw new Error(res.error.message || 'Adatbázis hiba');
+    return res.data;
+};
+
+// Teszthorog: a tools/api.test.mjs ezen keresztül cserél memóriabeli adatbázist.
+// Éles futásban soha nem hívódik meg.
+export const __setDbForTests = (client) => { _db = client; };
 
 // === SEGÉDFÜGGVÉNYEK ===
-
-const transformRowToBeer = (row, userIndexes, ratedBy) => {
-    const beerName = row[userIndexes.beerName];
-    if (!beerName || beerName.trim() === '') return null;
-    return {
-        id: `${ratedBy}-${beerName.replace(/\s+/g, '-')}-${row[userIndexes.date] || ''}`,
-        beerName,
-        type: row[userIndexes.type] || 'N/A',
-        location: row[userIndexes.location] || '',
-        beerPercentage: parseFloat(row[userIndexes.beerPercentage]) || 0,
-        look: parseInt(row[userIndexes.look]) || 0,
-        smell: parseInt(row[userIndexes.smell]) || 0,
-        taste: parseInt(row[userIndexes.taste]) || 0,
-        totalScore: parseInt(row[userIndexes.score]) || 0,
-        avg: parseFloat(row[userIndexes.avg]) || 0,
-        date: row[userIndexes.date] || null,
-        ratedBy
-    };
-};
-
-// === GOOGLE SERVICE ACCOUNT KULCS NORMALIZÁLÁSA ===
-// A Vercel felületére bemásolt privát kulcs jellemzően háromféleképpen romlik el:
-//   1. idézőjelekkel együtt kerül be az értékbe,
-//   2. a sortörések "\n" szekvenciaként maradnak benne (ez a várt eset),
-//   3. JSON-ból másolva "\\n" lesz belőlük.
-// Mindhármat ugyanarra a valódi PEM formára hozzuk.
-const normalizePrivateKey = (raw) => {
-    if (!raw) return '';
-    let key = String(raw).trim();
-    if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
-        key = key.slice(1, -1);
-    }
-    return key.replace(/\\\\n/g, '\n').replace(/\\n/g, '\n').trim();
-};
-
-const isPemPrivateKey = (key) => /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(key)
-    && /-----END [A-Z ]*PRIVATE KEY-----/.test(key);
 
 const verifyUser = (req) => {
     const authHeader = req.headers.authorization;
@@ -71,14 +50,25 @@ const verifyUser = (req) => {
     return jwt.verify(token, process.env.JWT_SECRET);
 };
 
-// === 2FA TITKOS KULCS TITKOSÍTÁSA (nyugalmi állapotban, AES-256-GCM) ===
-// A TOTP-kulcsot nem lehet egyirányúan hashelni (a kódellenőrzéshez vissza kell tudni fejteni),
-// ezért a táblázatba írás előtt AES-256-GCM-mel titkosítjuk. A kulcs a TWOFA_ENC_KEY env-ből jön;
-// ha az nincs beállítva, a JWT_SECRET-re esik vissza, hogy a meglévő deploy ne törjön el.
+// A Sheets-verzió a dátumot "2026-09-05 12:34:56" alakban tárolta és így is
+// adta vissza a frontendnek. Ezt megtartjuk, hogy a megjelenítés ne változzon.
+const nowText = () => new Date().toISOString().replace('T', ' ').substring(0, 19);
+
+// A pontátlagot a Sheets magyar tizedesvesszővel tárolta ("5,00").
+// Az adatbázisban numeric, de a beírt formátum ugyanaz marad számként.
+const avgOf = (total) => Number((total / 3).toFixed(2));
+
+const numOr0 = (v) => {
+    const n = parseFloat(String(v ?? '').replace(',', '.'));
+    return Number.isFinite(n) ? n : 0;
+};
+
+// === 2FA TITKOS KULCS TITKOSÍTÁSA (AES-256-GCM) ===
+// Változatlan a Sheets-verzióhoz képest, hogy a meglévő kulcsok működjenek.
 const TWOFA_ENC_PREFIX = 'enc:v1:';
 const get2FAKey = () => crypto.createHash('sha256')
     .update(String(process.env.TWOFA_ENC_KEY || process.env.JWT_SECRET || ''))
-    .digest(); // 32 bájtos kulcs
+    .digest();
 
 const encrypt2FASecret = (plain) => {
     if (!plain) return '';
@@ -91,8 +81,7 @@ const encrypt2FASecret = (plain) => {
 
 const decrypt2FASecret = (stored) => {
     if (!stored) return '';
-    // Visszafelé kompatibilitás: a korábbi, még titkosítatlan kulcsokat változatlanul visszaadjuk.
-    if (!String(stored).startsWith(TWOFA_ENC_PREFIX)) return stored;
+    if (!String(stored).startsWith(TWOFA_ENC_PREFIX)) return stored; // régi, titkosítatlan
     try {
         const data = Buffer.from(String(stored).slice(TWOFA_ENC_PREFIX.length), 'base64');
         const iv = data.subarray(0, 12);
@@ -103,106 +92,99 @@ const decrypt2FASecret = (stored) => {
         return Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
     } catch (e) {
         console.error('2FA decrypt error:', e);
-        return ''; // ne dőljön el a kérés; a megadott kód egyszerűen érvénytelennek számít majd
+        return '';
     }
 };
 
-// === STREAK SEGÉDFÜGGVÉNYEK ===
+// === PUBLIKUS PROFIL SEGÉDFÜGGVÉNYEK (változatlan logika) ===
 
-// Dátum konvertálása Év-Hét formátumra (pl. "2024-W05")
+const getPublicId = (email, secret) => crypto.createHmac('sha256', secret)
+    .update(String(email).trim().toLowerCase())
+    .digest('hex')
+    .substring(0, 12);
+
+// A settings már jsonb, de a régi kompatibilitás kedvéért stringet is elfogad.
+const parseUserSettings = (raw) => {
+    if (!raw) return {};
+    if (typeof raw === 'object') return raw;
+    try { return JSON.parse(raw); } catch (e) { return {}; }
+};
+
+const isProfilePublic = (s) => s.publicProfileOptIn === true || s.publicProfileOptIn === 'true';
+
+const asArray = (v) => Array.isArray(v) ? v : (typeof v === 'string' ? (() => {
+    try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch (e) { return []; }
+})() : []);
+
+const asObject = (v, fallback) => {
+    if (v && typeof v === 'object') return v;
+    if (typeof v === 'string') { try { return JSON.parse(v); } catch (e) { return fallback; } }
+    return fallback;
+};
+
+// === STREAK ===
+
 const getYearWeek = (date) => {
     const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
     const dayNum = d.getUTCDay() || 7;
     d.setUTCDate(d.getUTCDate() + 4 - dayNum);
-    const yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
-    const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1)/7);
+    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
     return `${d.getUTCFullYear()}-W${String(weekNo).padStart(2, '0')}`;
 };
 
-// Streak frissítése a Sheet-ben
-async function updateUserStreak(sheets, spreadsheetId, userEmail) {
+// A Sheets-verzióban ez 2 teljes laplekérés + 1 írás volt. Most 1 olvasás + 1 írás.
+async function updateUserStreak(userEmail) {
     try {
-        // 1. Felhasználó megkeresése
-        const usersRes = await sheets.spreadsheets.values.get({ 
-            spreadsheetId, 
-            range: `Felhasználók!A:K` // Kibővítjük a lekérést a K oszlopig
-        });
-        
-        const rows = usersRes.data.values || [];
-        const rowIndex = rows.findIndex(row => row[1] === userEmail); // 1-es index az email
-        
-        if (rowIndex === -1) return null;
+        const rows = must(await db().from('users')
+            .select('last_activity_week,current_streak,longest_streak')
+            .eq('email', userEmail).limit(1));
+        if (!rows || rows.length === 0) return null;
 
-        // Adatok kiolvasása (I, J, K oszlopok -> index 8, 9, 10)
-        const lastActivityWeek = rows[rowIndex][8] || "";
-        let currentStreak = parseInt(rows[rowIndex][9]) || 0;
-        let longestStreak = parseInt(rows[rowIndex][10]) || 0;
-
+        const u = rows[0];
         const currentYearWeek = getYearWeek(new Date());
+        let currentStreak = u.current_streak || 0;
+        let longestStreak = u.longest_streak || 0;
 
-        // LOGIKA:
-        if (lastActivityWeek === currentYearWeek) {
-            // Már posztolt ezen a héten -> Nincs teendő, csak visszaadjuk a jelenlegit
+        if (u.last_activity_week === currentYearWeek) {
             return { currentStreak, longestStreak, isNew: false };
         }
 
-        // Előző hét kiszámítása ellenőrzéshez
         const d = new Date();
-        d.setDate(d.getDate() - 7); // Visszamegyünk 7 napot
+        d.setDate(d.getDate() - 7);
         const previousWeek = getYearWeek(d);
 
-        if (lastActivityWeek === previousWeek) {
-            // Múlt héten posztolt -> Növeljük a streak-et
-            currentStreak++;
-        } else {
-            // Kihagyott egy hetet (vagy ez az első) -> Reset 1-re
-            currentStreak = 1;
-        }
+        currentStreak = (u.last_activity_week === previousWeek) ? currentStreak + 1 : 1;
+        if (currentStreak > longestStreak) longestStreak = currentStreak;
 
-        // Rekord ellenőrzése
-        if (currentStreak > longestStreak) {
-            longestStreak = currentStreak;
-        }
-
-        // Mentés a Sheet-be (I, J, K oszlopok frissítése az adott sorban)
-        const updateRange = `Felhasználók!I${rowIndex + 1}:K${rowIndex + 1}`;
-        await sheets.spreadsheets.values.update({
-            spreadsheetId,
-            range: updateRange,
-            valueInputOption: 'USER_ENTERED',
-            resource: { values: [[currentYearWeek, currentStreak, longestStreak]] }
-        });
+        must(await db().from('users').update({
+            last_activity_week: currentYearWeek,
+            current_streak: currentStreak,
+            longest_streak: longestStreak
+        }).eq('email', userEmail));
 
         return { currentStreak, longestStreak, isNew: true };
-
     } catch (e) {
-        console.error("Streak update error:", e);
+        console.error('Streak update error:', e);
         return null;
     }
 }
 
-// === PUBLIKUS PROFIL / TOPLISTA SEGÉDFÜGGVÉNYEK ===
+// === FELHASZNÁLÓ -> FRONTEND OBJEKTUM ===
+// Pontosan ugyanazok a mezők, mint a Sheets-verzióban.
+const toUserObject = (u, has2FA) => ({
+    name: u.name,
+    email: u.email,
+    has2FA: has2FA,
+    achievements: asObject(u.achievements, { unlocked: [] }),
+    badge: u.badge || '',
+    streak: { current: u.current_streak || 0, longest: u.longest_streak || 0 },
+    isGoogleLinked: !!u.google_id,
+    settings: asObject(u.settings, {})
+});
 
-// Publikus azonosító az e-mail címből (HMAC) - így az e-mail cím SOHA nem kerül ki a kliensekhez
-const getPublicId = (email, secret) => {
-    return crypto.createHmac('sha256', secret)
-        .update(String(email).trim().toLowerCase())
-        .digest('hex')
-        .substring(0, 12);
-};
-
-const parseUserSettings = (raw) => {
-    try { return raw ? JSON.parse(raw) : {}; } catch (e) { return {}; }
-};
-
-// OPT-IN: a profil csak akkor publikus, ha a felhasználó kifejezetten bekapcsolta a Fiókom fülön.
-// Szándékosan új kulcs (publicProfileOptIn), hogy a korábbi automatikus settings-szinkron értékei ne számítsanak.
-const isProfilePublic = (settings) => settings.publicProfileOptIn === true || settings.publicProfileOptIn === 'true';
-
-// Magyar formátumú szám (pl. "8,33") biztonságos parse-olása
-const parseHuFloat = (val) => parseFloat(String(val ?? '').replace(',', '.')) || 0;
-
-// Sör- és italértékelések összesítése e-mail címenként (toplistához és publikus profilhoz)
+// === ÉRTÉKELÉSI STATISZTIKA (toplista + publikus profil) ===
+// Ugyanaz a számítás, mint korábban, csak már szűrt adaton dolgozik.
 const buildRatingStats = (beerRows, drinkRows) => {
     const stats = {};
     const ensure = (email) => {
@@ -212,132 +194,41 @@ const buildRatingStats = (beerRows, drinkRows) => {
         return stats[email];
     };
 
-    // Vendég Sör Teszt: A=dátum, C=név, D=hely, E=típus, K=átlag, N=email
-    beerRows.forEach(row => {
-        const email = row[13];
-        const name = row[2];
-        if (!email || !email.includes('@') || !name) return;
+    (beerRows || []).forEach(r => {
+        const email = r.user_email;
+        if (!email || !email.includes('@') || !r.beer_name) return;
         const s = ensure(email);
-        const avg = parseHuFloat(row[10]);
+        const avg = numOr0(r.avg);
         s.beerCount++;
         s.sumAvg += avg;
-        s.beers.push({ name, type: row[4] || 'N/A', avg });
-        if (row[4]) s.types[row[4]] = (s.types[row[4]] || 0) + 1;
-        if (row[3]) s.locations[row[3]] = (s.locations[row[3]] || 0) + 1;
-        if (row[0] && (!s.firstDate || row[0] < s.firstDate)) s.firstDate = row[0];
+        s.beers.push({ name: r.beer_name, type: r.type || 'N/A', avg });
+        if (r.type) s.types[r.type] = (s.types[r.type] || 0) + 1;
+        if (r.location) s.locations[r.location] = (s.locations[r.location] || 0) + 1;
+        if (r.date_text && (!s.firstDate || r.date_text < s.firstDate)) s.firstDate = r.date_text;
     });
 
-    // Vendég ital teszt: A=dátum, C=név, E=típus, L=átlag, N=email
-    drinkRows.forEach(row => {
-        const email = row[13];
-        const name = row[2];
-        if (!email || !email.includes('@') || !name) return;
+    (drinkRows || []).forEach(r => {
+        const email = r.user_email;
+        if (!email || !email.includes('@') || !r.drink_name) return;
         const s = ensure(email);
-        const avg = parseHuFloat(row[11]);
+        const avg = numOr0(r.avg);
         s.drinkCount++;
         s.sumAvg += avg;
-        s.drinks.push({ name, type: row[4] || row[3] || 'N/A', avg });
-        if (row[0] && (!s.firstDate || row[0] < s.firstDate)) s.firstDate = row[0];
+        s.drinks.push({ name: r.drink_name, type: r.type || r.category || 'N/A', avg });
+        if (r.date_text && (!s.firstDate || r.date_text < s.firstDate)) s.firstDate = r.date_text;
     });
 
     return stats;
 };
 
-
-// === FŐ HANDLER FÜGGVÉNY ===
+// === FŐ HANDLER ===
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
 
     const { action } = req.body;
-    const { SPREADSHEET_ID, GOOGLE_PRIVATE_KEY, GOOGLE_CLIENT_EMAIL, JWT_SECRET } = process.env;
+    const JWT_SECRET = process.env.JWT_SECRET;
 
-    // === A GOOGLE CLIENT ID KIADÁSA A FRONTENDNEK ===
-    // A Client ID publikus adat (minden oldal forrásában benne van), viszont így
-    // deploymentenként a Vercel env változó dönti el, melyik OAuth klienst használjuk,
-    // nem pedig egy kódba égetett érték. A config-ellenőrzés előtt fut, mert
-    // csak a GOOGLE_CLIENT_ID kell hozzá.
-    if (action === 'GET_PUBLIC_CONFIG') {
-        return res.status(200).json({ googleClientId: process.env.GOOGLE_CLIENT_ID || null });
-    }
-
-    // === DIAGNOSZTIKA ===
-    // Szándékosan a config-ellenőrzés ELŐTT fut, hogy pont akkor is használható legyen,
-    // amikor a környezeti változók hiányoznak (pl. frissen létrehozott Vercel projektnél).
-    // Titkot nem ad vissza: csak azt, hogy egy változó be van-e állítva, illetve hogy a
-    // service account tényleg eléri-e a táblázatot. A service account e-mail és a
-    // spreadsheet ID csak helyes ADMIN_PIN mellett kerül bele.
-    if (action === 'HEALTH_CHECK') {
-        const normalizedKey = normalizePrivateKey(GOOGLE_PRIVATE_KEY);
-        const isAdmin = !!process.env.ADMIN_PIN
-            && String(req.body.pin || '').trim() === String(process.env.ADMIN_PIN).trim();
-
-        const report = {
-            env: {
-                SPREADSHEET_ID: !!SPREADSHEET_ID,
-                GOOGLE_CLIENT_EMAIL: !!GOOGLE_CLIENT_EMAIL,
-                GOOGLE_PRIVATE_KEY: !!GOOGLE_PRIVATE_KEY,
-                JWT_SECRET: !!JWT_SECRET,
-                GOOGLE_CLIENT_ID: !!process.env.GOOGLE_CLIENT_ID,
-                ADMIN_PIN: !!process.env.ADMIN_PIN,
-                TWOFA_ENC_KEY: !!process.env.TWOFA_ENC_KEY
-            },
-            privateKey: {
-                looksLikePem: isPemPrivateKey(normalizedKey),
-                hasRealNewlines: normalizedKey.includes('\n'),
-                length: normalizedKey.length
-            },
-            googleClientId: process.env.GOOGLE_CLIENT_ID || null,
-            sheet: { checked: false }
-        };
-
-        // Élő próba: ez mutatja meg, hogy a service accountnak tényleg van-e joga
-        // EHHEZ a táblázathoz, és megvan-e benne a Felhasználók munkalap.
-        if (report.env.SPREADSHEET_ID && report.env.GOOGLE_CLIENT_EMAIL && report.privateKey.looksLikePem) {
-            try {
-                const probeAuth = new google.auth.GoogleAuth({
-                    credentials: { client_email: GOOGLE_CLIENT_EMAIL, private_key: normalizedKey },
-                    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-                });
-                const probeSheets = google.sheets({ version: 'v4', auth: probeAuth });
-                const meta = await probeSheets.spreadsheets.get({
-                    spreadsheetId: SPREADSHEET_ID,
-                    fields: 'sheets.properties.title'
-                });
-                const tabs = (meta.data.sheets || []).map(s => s.properties.title);
-                const hasUsersTab = tabs.includes(USERS_SHEET);
-
-                let userCount = null;
-                if (hasUsersTab) {
-                    const usersProbe = await probeSheets.spreadsheets.values.get({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: `${USERS_SHEET}!A:B`
-                    });
-                    userCount = (usersProbe.data.values || []).filter(row => row[1]).length;
-                }
-
-                report.sheet = { checked: true, ok: true, hasUsersTab, userCount };
-                if (isAdmin) report.sheet.tabs = tabs;
-            } catch (probeError) {
-                report.sheet = {
-                    checked: true,
-                    ok: false,
-                    status: probeError.code || probeError.status || null,
-                    message: probeError.message
-                };
-            }
-        }
-
-        if (isAdmin) {
-            report.serviceAccount = GOOGLE_CLIENT_EMAIL || null;
-            report.spreadsheetId = SPREADSHEET_ID || null;
-        }
-
-        return res.status(200).json(report);
-    }
-
-    // A hiányzó változó NEVE nem titok, az értéke igen - a nevek kiírása viszont
-    // percekre rövidíti a hibakeresést egy frissen létrehozott Vercel projektnél.
-    const missingEnv = ['SPREADSHEET_ID', 'GOOGLE_CLIENT_EMAIL', 'GOOGLE_PRIVATE_KEY', 'JWT_SECRET']
+    const missingEnv = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET']
         .filter(name => !process.env[name]);
     if (missingEnv.length > 0) {
         return res.status(500).json({
@@ -345,413 +236,150 @@ export default async function handler(req, res) {
         });
     }
 
-    const privateKey = normalizePrivateKey(GOOGLE_PRIVATE_KEY);
-    if (!isPemPrivateKey(privateKey)) {
-        return res.status(500).json({
-            error: "Szerveroldali konfigurációs hiba: a GOOGLE_PRIVATE_KEY nem érvényes PEM kulcs (hiányzik a -----BEGIN PRIVATE KEY----- / -----END PRIVATE KEY----- rész). Másold be újra a service account JSON private_key mezőjét."
-        });
-    }
-
     try {
-        const auth = new google.auth.GoogleAuth({
-            credentials: { client_email: GOOGLE_CLIENT_EMAIL, private_key: privateKey },
-            scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-        });
-        const sheets = google.sheets({ version: 'v4', auth });
-
         switch (action) {
-            
+
+            // === ADMIN BELÉPÉS + ADMIN SÖRÖK ===
             case 'GET_DATA': {
                 const { pin } = req.body;
                 const correctPin = process.env.ADMIN_PIN;
+                if (!correctPin) return res.status(500).json({ error: 'Szerver hiba: Nincs beállítva PIN.' });
 
-                if (!correctPin) {
-                    return res.status(500).json({ error: 'Szerver hiba: Nincs beállítva PIN.' });
-                }
-
-                // === BIZTONSÁGI BŐVÍTÉS ===
-                // Ha a PIN hibás, várakoztatjuk a választ 2-3 másodpercig.
-                // Így egy robotnak évekbe telne végigpróbálni az összes kombinációt.
                 if (String(pin).trim() !== String(correctPin).trim()) {
-                    await new Promise(resolve => setTimeout(resolve, 2000)); // 2 másodperc szünet
+                    await new Promise(r => setTimeout(r, 2000)); // brute-force lassítás
                     return res.status(401).json({ error: 'Hibás PIN kód!' });
                 }
-                
+
                 const adminToken = jwt.sign(
-                    { 
-                        email: 'admin@sortablazat.hu', name: 'Admin', isAdmin: true }, 
-                        process.env.JWT_SECRET, 
-                        { expiresIn: '1d' }
+                    { email: 'admin@sortablazat.hu', name: 'Admin', isAdmin: true },
+                    JWT_SECRET, { expiresIn: '1d' }
                 );
 
-                // Adatok lekérése (EZ IS MARAD A RÉGI)
-                const sörökResponse = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: ADMIN_BEERS_SHEET });
-                const allRows = sörökResponse.data.values || [];
-                const allBeers = [];
-                allRows.forEach(row => {
-                    const beer1 = transformRowToBeer(row, COL_INDEXES.admin1, 'admin1');
-                    if (beer1) allBeers.push(beer1);
-                    const beer2 = transformRowToBeer(row, COL_INDEXES.admin2, 'admin2');
-                    if (beer2) allBeers.push(beer2);
-                });
-                
-                return res.status(200).json({ beers: allBeers, users: [], adminToken: adminToken });
+                const rows = must(await db().from('admin_beers')
+                    .select('rated_by,beer_name,type,location,beer_percentage,look,smell,taste,total_score,avg,date_text')
+                    .order('id', { ascending: true }));
+
+                const beers = (rows || []).map(r => ({
+                    id: `${r.rated_by}-${String(r.beer_name).replace(/\s+/g, '-')}-${r.date_text || ''}`,
+                    beerName: r.beer_name,
+                    type: r.type || 'N/A',
+                    location: r.location || '',
+                    beerPercentage: numOr0(r.beer_percentage),
+                    look: parseInt(r.look) || 0,
+                    smell: parseInt(r.smell) || 0,
+                    taste: parseInt(r.taste) || 0,
+                    totalScore: parseInt(r.total_score) || 0,
+                    avg: numOr0(r.avg),
+                    date: r.date_text || null,
+                    ratedBy: r.rated_by
+                }));
+
+                return res.status(200).json({ beers, users: [], adminToken });
             }
 
+            // === REGISZTRÁCIÓ ===
             case 'REGISTER_USER': {
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) return res.status(400).json({ error: "Minden mező kitöltése kötelező!" });
-    
-    // Jelszó ellenőrzés
-    const passwordRegex = /^(?=.*[0-9])(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]).{8,}$/;
-    if (!passwordRegex.test(password)) {
-        return res.status(400).json({ error: "A jelszó gyenge! (Min. 8 karakter, 1 szám, 1 spec. karakter)" });
-    }
+                const { name, email, password } = req.body;
+                if (!name || !email || !password) return res.status(400).json({ error: "Minden mező kitöltése kötelező!" });
 
-    const users = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: USERS_SHEET });
-    const userExists = users.data.values?.some(row => row[1] === email);
-    if (userExists) return res.status(409).json({ error: "Ez az e-mail cím már regisztrálva van." });
-    
-    const hashedPassword = await bcrypt.hash(password, 10);
-    
-    // --- ÚJ RÉSZ: Helyreállító kód generálás ---
-    // Generálunk egy véletlenszerű 8 karakteres kódot
-    const recoveryCode = Math.random().toString(36).slice(-8).toUpperCase();
-    const hashedRecovery = await bcrypt.hash(recoveryCode, 10); // Ezt is titkosítva mentjük!
-    // -------------------------------------------
-
-    const defaultAchievements = { unlocked: [] };
-    
-    // A táblázatba beírjuk a recovery hash-t is a H oszlopba (index 7)
-    await sheets.spreadsheets.values.append({
-        spreadsheetId: SPREADSHEET_ID,
-        range: USERS_SHEET,
-        valueInputOption: 'USER_ENTERED',
-        // Figyeld a végét: hashedRecovery hozzáadva
-        resource: { values: [[name, email, hashedPassword, '', 'FALSE', JSON.stringify(defaultAchievements), '', hashedRecovery]] },
-    });
-
-    // Visszaküldjük a kódot a felhasználónak (csak most látja utoljára!)
-    return res.status(201).json({ 
-        message: "Sikeres regisztráció!", 
-        recoveryCode: recoveryCode 
-    });
-}
-
-            case 'RESET_PASSWORD': {
-    const { email, recoveryCode, newPassword } = req.body;
-    if (!email || !recoveryCode || !newPassword) return res.status(400).json({ error: "Hiányzó adatok!" });
-
-    // 1. Felhasználó megkeresése
-    const usersResponse = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${USERS_SHEET}!A:H` });
-    const rows = usersResponse.data.values || [];
-    const rowIndex = rows.findIndex(row => row[1] === email); // 1-es index az email
-
-    if (rowIndex === -1) return res.status(404).json({ error: "Nincs ilyen felhasználó." });
-
-    const userRow = rows[rowIndex];
-    const storedRecoveryHash = userRow[7]; // H oszlop (index 7) a recovery kód
-
-    if (!storedRecoveryHash) return res.status(400).json({ error: "Ehhez a fiókhoz nincs beállítva helyreállító kód." });
-
-    // 2. Kód ellenőrzése
-    const isCodeValid = await bcrypt.compare(recoveryCode, storedRecoveryHash);
-    if (!isCodeValid) return res.status(401).json({ error: "Hibás helyreállító kód!" });
-
-    // 3. Új jelszó mentése
-    const newHashedPassword = await bcrypt.hash(newPassword, 10);
-    
-    // Jelszó frissítése (C oszlop - index 2)
-    const updateRange = `${USERS_SHEET}!C${rowIndex + 1}`;
-    await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: updateRange,
-        valueInputOption: 'USER_ENTERED',
-        resource: { values: [[newHashedPassword]] },
-    });
-
-    return res.status(200).json({ message: "Jelszó sikeresen megváltoztatva! Most már beléphetsz." });
-}
-
-            case 'REPORT_CONTENT': {
-                const userData = verifyUser(req);
-                // MÁR NEM kérünk be 'reportedUserEmail'-t a klienstől, csak contentId-t (ami az index)
-                const { type, contentId, reason } = req.body; 
-                
-                if (!reason) return res.status(400).json({ error: "Indoklás kötelező!" });
-                if (contentId === undefined || contentId === null) return res.status(400).json({ error: "Hiányzó tartalom azonosító!" });
-
-                let targetSheet = '';
-                let emailColumn = ''; // A betűjele az oszlopnak, ahol az email van
-
-                // 1. Meghatározzuk, melyik munkalapon kell keresni
-                switch (type) {
-                    case 'Sör': // Vendég Sör Teszt
-                        targetSheet = GUEST_BEERS_SHEET;
-                        emailColumn = 'N'; // N oszlop (13. index)
-                        break;
-                    case 'Ital': // Vendég ital teszt
-                        targetSheet = GUEST_DRINKS_SHEET;
-                        emailColumn = 'N'; // N oszlop (13. index)
-                        break;
-                    case 'Ötlet': // Vendég ötletek
-                        targetSheet = IDEAS_SHEET;
-                        emailColumn = 'F'; // F oszlop (5. index)
-                        break;
-                    case 'Ajánlás': // Vendég sör ajánló
-                        targetSheet = RECOMMENDATIONS_SHEET;
-                        emailColumn = 'C'; // C oszlop (2. index)
-                        break;
-                    default:
-                        return res.status(400).json({ error: "Ismeretlen tartalom típus!" });
+                const passwordRegex = /^(?=.*[0-9])(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]).{8,}$/;
+                if (!passwordRegex.test(password)) {
+                    return res.status(400).json({ error: "A jelszó gyenge! (Min. 8 karakter, 1 szám, 1 spec. karakter)" });
                 }
 
-                try {
-                    // 2. Kikeresjük a panaszolt fél e-mail címét a táblázatból
-                    // A Sheets sorok 1-től kezdődnek, a frontend tömb indexe 0-tól.
-                    // Általában: SorIndex = ContentId + 1 
-                    // (Feltételezve, hogy a contentId a tömb indexe, és a sheet 1. sora a fejléc)
-                    const rowIndex = parseInt(contentId) + 1; 
+                const hashedPassword = await bcrypt.hash(password, 10);
+                const recoveryCode = Math.random().toString(36).slice(-8).toUpperCase();
+                const hashedRecovery = await bcrypt.hash(recoveryCode, 10);
 
-                    const emailRes = await sheets.spreadsheets.values.get({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: `${targetSheet}!${emailColumn}${rowIndex}`
-                    });
+                // A UNIQUE megszorítás miatt itt már nincs versenyhelyzet:
+                // két egyidejű regisztrációból a másodikat az adatbázis utasítja el.
+                const ins = await db().from('users').insert([{
+                    name, email,
+                    password_hash: hashedPassword,
+                    twofa_secret: '', twofa_enabled: false,
+                    achievements: { unlocked: [] },
+                    badge: '',
+                    recovery_hash: hashedRecovery
+                }]);
 
-                    const foundEmail = emailRes.data.values ? emailRes.data.values[0][0] : null;
-
-                    if (!foundEmail) {
-                        return res.status(404).json({ error: "A jelentett tartalom vagy felhasználó nem található." });
+                if (ins.error) {
+                    if (String(ins.error.code) === '23505' || /duplicate key/i.test(ins.error.message || '')) {
+                        return res.status(409).json({ error: "Ez az e-mail cím már regisztrálva van." });
                     }
-
-                    // 3. Mentés a Jelentések munkalapra
-                    const timestamp = new Date().toLocaleString('hu-HU');
-                    const newRow = [
-                        timestamp,              // A: Dátum
-                        userData.email,         // B: Jelentő
-                        type,                   // C: Típus
-                        contentId,              // D: Tartalom ID (Index)
-                        foundEmail,             // E: Panaszolt fél (MOST KERESTÜK KI)
-                        reason,                 // F: Indok
-                        'Nyitott'               // G: Státusz
-                    ];
-
-                    await sheets.spreadsheets.values.append({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: `Jelentések!A:G`,
-                        valueInputOption: 'USER_ENTERED',
-                        resource: { values: [newRow] }
-                    });
-
-                    return res.status(200).json({ message: "Jelentés elküldve a moderátoroknak. Köszönjük az éberséget! 🛡️" });
-
-                } catch (error) {
-                    console.error("Jelentés hiba:", error);
-                    return res.status(500).json({ error: "Szerver hiba a jelentés feldolgozása közben." });
-                }
-            }
-
-            // === MODERÁCIÓS LISTA LEKÉRÉSE (ADMIN) ===
-            case 'GET_MODERATION_TASKS': {
-                const userData = verifyUser(req);
-                if (!userData.isAdmin) return res.status(403).json({ error: "Nincs jogosultságod ehhez a művelethez. 🚫" });
-
-                const reportsRes = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `Jelentések!A:G` });
-                const reports = (reportsRes.data.values || []).map((row, i) => {
-                    if (i===0 || !row[0]) return null;
-                    return {
-                        index: i, // Sor index
-                        date: row[0],
-                        reporter: row[1],
-                        type: row[2],
-                        content: row[3],
-                        reportedUser: row[4],
-                        reason: row[5],
-                        status: row[6]
-                    };
-                }).filter(r => r && r.status !== 'Lezárva').reverse();
-
-                return res.status(200).json(reports);
-            }
-
-            // === FIGYELMEZTETÉS / KITILTÁS (ADMIN) ===
-            case 'WARN_USER': {
-                const userData = verifyUser(req);
-                if (!userData.isAdmin) return res.status(403).json({ error: "Nincs jogosultságod ehhez a művelethez. 🚫" });
-                const { targetEmail, reportIndex } = req.body; // reportIndex: hogy lezárjuk a jelentést
-
-                // 1. Felhasználó megkeresése
-                const usersRes = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${USERS_SHEET}!A:N` });
-                const rows = usersRes.data.values || [];
-                const rowIndex = rows.findIndex(row => row[1] === targetEmail);
-
-                if (rowIndex === -1) return res.status(404).json({ error: "Felhasználó nem található." });
-
-                const userRow = rows[rowIndex];
-                let warnings = [];
-                try {
-                    // M oszlop (index 12) a figyelmeztetések
-                    if (userRow[12]) warnings = JSON.parse(userRow[12]);
-                } catch (e) {}
-
-                // 2. Lejárt figyelmeztetések törlése (TISZTÍTÁS)
-                const now = new Date();
-                const sixMonthsAgo = new Date();
-                sixMonthsAgo.setMonth(now.getMonth() - 6);
-
-                warnings = warnings.filter(w => new Date(w.date) > sixMonthsAgo);
-
-                // 3. Új figyelmeztetés hozzáadása
-                warnings.push({ date: now.toISOString(), reason: "Admin által jóváhagyott jelentés" });
-
-                // 4. Kitiltás ellenőrzése (Ha eléri a 2-t)
-                let isBanned = 'FALSE';
-                let message = "Figyelmeztetés kiadva.";
-                
-                if (warnings.length >= 2) {
-                    isBanned = 'TRUE';
-                    message = "Figyelmeztetés kiadva. A felhasználó automatikusan KITILTÁSRA került (2/2). 🚫";
+                    throw new Error(ins.error.message);
                 }
 
-                // 5. Adatok mentése (M és N oszlop)
-                const range = `${USERS_SHEET}!M${rowIndex + 1}:N${rowIndex + 1}`;
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: range,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: [[JSON.stringify(warnings), isBanned]] }
-                });
-
-                // 6. Jelentés lezárása (ha volt kapcsolódó jelentés)
-                if (reportIndex) {
-                    await sheets.spreadsheets.values.update({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: `Jelentések!G${parseInt(reportIndex) + 1}`,
-                        valueInputOption: 'USER_ENTERED',
-                        resource: { values: [['Lezárva (Büntetve)']] }
-                    });
-                }
-
-                return res.status(200).json({ message, activeWarnings: warnings.length });
+                return res.status(201).json({ message: "Sikeres regisztráció!", recoveryCode });
             }
 
+            // === JELSZÓ HELYREÁLLÍTÁS ===
+            case 'RESET_PASSWORD': {
+                const { email, recoveryCode, newPassword } = req.body;
+                if (!email || !recoveryCode || !newPassword) return res.status(400).json({ error: "Hiányzó adatok!" });
+
+                const rows = must(await db().from('users')
+                    .select('id,recovery_hash').eq('email', email).limit(1));
+                if (!rows || rows.length === 0) return res.status(404).json({ error: "Nincs ilyen felhasználó." });
+
+                const storedRecoveryHash = rows[0].recovery_hash;
+                if (!storedRecoveryHash) return res.status(400).json({ error: "Ehhez a fiókhoz nincs beállítva helyreállító kód." });
+
+                const isCodeValid = await bcrypt.compare(recoveryCode, storedRecoveryHash);
+                if (!isCodeValid) return res.status(401).json({ error: "Hibás helyreállító kód!" });
+
+                must(await db().from('users')
+                    .update({ password_hash: await bcrypt.hash(newPassword, 10) })
+                    .eq('id', rows[0].id));
+
+                return res.status(200).json({ message: "Jelszó sikeresen megváltoztatva! Most már beléphetsz." });
+            }
+
+            // === BEJELENTKEZÉS ===
+            // Korábban: a TELJES Felhasználók lap letöltése minden belépésnél.
+            // Most: egyetlen indexelt lekérdezés.
             case 'LOGIN_USER': {
-    const { email, password } = req.body;
-    const usersResponse = await sheets.spreadsheets.values.get({ 
-        spreadsheetId: SPREADSHEET_ID, 
-        range: `${USERS_SHEET}!A:O` // Most már A-tól O-ig kérjük
-    });
-    
-    const rows = usersResponse.data.values || [];
-    const rowIndex = rows.findIndex(row => row[1] === email);
-    if (rowIndex === -1) return res.status(401).json({ error: "Hibás e-mail cím vagy jelszó." });
-    
-    const userRow = rows[rowIndex];
-    const isPasswordValid = await bcrypt.compare(password, userRow[2]);
-    if (!isPasswordValid) return res.status(401).json({ error: "Hibás e-mail cím vagy jelszó." });
+                const { email, password } = req.body;
+                const rows = must(await db().from('users').select('*').eq('email', email).limit(1));
+                if (!rows || rows.length === 0) return res.status(401).json({ error: "Hibás e-mail cím vagy jelszó." });
 
-    if (userRow[13] === 'TRUE') {
-        return res.status(403).json({ error: "A fiókod fel lett függesztve a szabályzat megsértése miatt. 🚫" });
-    }
+                const u = rows[0];
+                const isPasswordValid = await bcrypt.compare(password, u.password_hash || '');
+                if (!isPasswordValid) return res.status(401).json({ error: "Hibás e-mail cím vagy jelszó." });
 
-    // 2FA ellenőrzés (E oszlop - index 4)
-    const is2FAEnabled = userRow[4] === 'TRUE';
-    if (is2FAEnabled) {
-        return res.status(200).json({ 
-            require2fa: true, 
-            tempEmail: email
-        });
-    }
-    
-    // ÚJ: Achievements betöltése (F oszlop - index 5)
-    let achievements = { unlocked: [] };
-    try {
-        if (userRow[5]) {
-            achievements = JSON.parse(userRow[5]);
-        }
-    } catch (e) {
-        console.warn("Achievements parse error:", e);
-    }
-    let settings = {};
-    try { if (userRow[14]) settings = JSON.parse(userRow[14]); } catch (e) {}
-    
-    // ÚJ: Badge betöltése (G oszlop - index 6)
-    const badge = userRow[6] || '';
-    const currentStreak = parseInt(userRow[9]) || 0;
-    const longestStreak = parseInt(userRow[10]) || 0;
-    
-    // Hagyományos belépés
-    const user = { 
-        name: userRow[0], 
-        email: userRow[1], 
-        has2FA: false,
-        achievements: achievements, // ÚJ
-        badge: badge, // ÚJ
-        streak: { current: currentStreak, longest: longestStreak },
-        isGoogleLinked: !!userRow[11],
-        settings: settings
-    };
-    
-    const token = jwt.sign(user, JWT_SECRET, { expiresIn: '1d' });
-    return res.status(200).json({ token, user });
-}
+                if (u.is_banned) {
+                    return res.status(403).json({ error: "A fiókod fel lett függesztve a szabályzat megsértése miatt. 🚫" });
+                }
+
+                if (u.twofa_enabled) {
+                    return res.status(200).json({ require2fa: true, tempEmail: email });
+                }
+
+                const user = toUserObject(u, false);
+                const token = jwt.sign(user, JWT_SECRET, { expiresIn: '1d' });
+                return res.status(200).json({ token, user });
+            }
+
             case 'VERIFY_2FA_LOGIN': {
-    const { email, token: inputToken } = req.body;
-    
-    const usersResponse = await sheets.spreadsheets.values.get({ 
-        spreadsheetId: SPREADSHEET_ID, 
-        range: `${USERS_SHEET}!A:O` 
-    });
-   const rows = usersResponse.data.values || [];
-    const userRow = rows.find(row => row[1] === email);
-    if (!userRow) return res.status(401).json({ error: "Hiba az azonosításban." });
+                const { email, token: inputToken } = req.body;
+                const rows = must(await db().from('users').select('*').eq('email', email).limit(1));
+                if (!rows || rows.length === 0) return res.status(401).json({ error: "Hiba az azonosításban." });
 
+                const u = rows[0];
+                if (u.is_banned) return res.status(403).json({ error: "A fiókod fel lett függesztve. 🚫" });
 
-    if (userRow[13] === 'TRUE') {
-        return res.status(403).json({ error: "A fiókod fel lett függesztve. 🚫" });
-    }
+                const secret = decrypt2FASecret(u.twofa_secret);
+                if (!authenticator.check(inputToken, secret)) {
+                    return res.status(401).json({ error: "Érvénytelen 2FA kód!" });
+                }
 
-    const secret = decrypt2FASecret(userRow[3]);
-    const isValid = authenticator.check(inputToken, secret);
-
-    if (!isValid) return res.status(401).json({ error: "Érvénytelen 2FA kód!" });
-
-    // ÚJ: Achievements betöltése
-    let achievements = { unlocked: [] };
-    try {
-        if (userRow[5]) {
-            achievements = JSON.parse(userRow[5]);
-        }
-    } catch (e) {
-        console.warn("Achievements parse error:", e);
-    }
-    let settings = {};
-    try { if (userRow[14]) settings = JSON.parse(userRow[14]); } catch (e) {}
-    
-    const badge = userRow[6] || '';
-    const currentStreak = parseInt(userRow[9]) || 0;
-    const longestStreak = parseInt(userRow[10]) || 0;
-
-const user = { 
-    name: userRow[0], 
-    email: userRow[1], 
-    has2FA: (action === 'VERIFY_2FA_LOGIN' ? true : false), // Vagy ahogy a te kódodban van
-    achievements: achievements,
-    badge: badge,
-    streak: { current: currentStreak, longest: longestStreak },
-    isGoogleLinked: !!userRow[11],
-    settings: settings
-};
-    
-    const jwtToken = jwt.sign(user, JWT_SECRET, { expiresIn: '1d' });
-    return res.status(200).json({ token: jwtToken, user });
-}
-
-            
+                const user = toUserObject(u, true);
+                const jwtToken = jwt.sign(user, JWT_SECRET, { expiresIn: '1d' });
+                return res.status(200).json({ token: jwtToken, user });
+            }
 
             case 'MANAGE_2FA': {
                 const userData = verifyUser(req);
-                const { subAction, code, secret } = req.body; // subAction: 'GENERATE', 'ENABLE', 'DISABLE'
+                const { subAction, code, secret } = req.body;
 
                 if (subAction === 'GENERATE') {
                     const newSecret = authenticator.generateSecret();
@@ -761,255 +389,25 @@ const user = {
                 }
 
                 if (subAction === 'ENABLE') {
-                    // Ellenőrizzük a kódot a mentés előtt
-                    const isValid = authenticator.check(code, secret);
-                    if (!isValid) return res.status(400).json({ error: "Hibás kód! Próbáld újra." });
-
-                    // Mentés a Sheet-be
-                    const usersResponse = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: USERS_SHEET });
-                    const rows = usersResponse.data.values || [];
-                    const rowIndex = rows.findIndex(row => row[1] === userData.email);
-
-                    if (rowIndex === -1) return res.status(404).json({ error: "Felhasználó nem található." });
-
-                    // D és E oszlop frissítése (index 3 és 4)
-                    // Megjegyzés: A sheets API update range-hez a sor indexét (rowIndex + 1) használjuk.
-                    // A range pl: Felhasználók!D2:E2
-                    const range = `${USERS_SHEET}!D${rowIndex + 1}:E${rowIndex + 1}`;
-                    
-                    await sheets.spreadsheets.values.update({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: range,
-                        valueInputOption: 'USER_ENTERED',
-                        resource: { values: [[encrypt2FASecret(secret), 'TRUE']] }
-                    });
-
+                    if (!authenticator.check(code, secret)) {
+                        return res.status(400).json({ error: "Hibás kód! Próbáld újra." });
+                    }
+                    const upd = must(await db().from('users')
+                        .update({ twofa_secret: encrypt2FASecret(secret), twofa_enabled: true })
+                        .eq('email', userData.email).select('id'));
+                    if (!upd || upd.length === 0) return res.status(404).json({ error: "Felhasználó nem található." });
                     return res.status(200).json({ message: "2FA sikeresen bekapcsolva!" });
                 }
 
                 if (subAction === 'DISABLE') {
-                     // Kikapcsolás a Sheet-ben
-                    const usersResponse = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: USERS_SHEET });
-                    const rows = usersResponse.data.values || [];
-                    const rowIndex = rows.findIndex(row => row[1] === userData.email);
-
-                    if (rowIndex === -1) return res.status(404).json({ error: "Felhasználó nem található." });
-
-                    const range = `${USERS_SHEET}!D${rowIndex + 1}:E${rowIndex + 1}`;
-                    await sheets.spreadsheets.values.update({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: range,
-                        valueInputOption: 'USER_ENTERED',
-                        resource: { values: [['', 'FALSE']] } // Töröljük a kulcsot és FALSE
-                    });
-
+                    const upd = must(await db().from('users')
+                        .update({ twofa_secret: '', twofa_enabled: false })
+                        .eq('email', userData.email).select('id'));
+                    if (!upd || upd.length === 0) return res.status(404).json({ error: "Felhasználó nem található." });
                     return res.status(200).json({ message: "2FA kikapcsolva." });
                 }
-                
+
                 return res.status(400).json({ error: "Ismeretlen művelet." });
-            }
-
-case 'UPDATE_ACHIEVEMENTS': {
-    const userData = verifyUser(req);
-    const { achievements, badge } = req.body;
-    
-    // Validálás
-    if (!achievements || typeof achievements !== 'object') {
-        return res.status(400).json({ error: "Hibás achievements formátum!" });
-    }
-    
-    // Users tábla lekérése
-    const usersResponse = await sheets.spreadsheets.values.get({ 
-        spreadsheetId: SPREADSHEET_ID, 
-        range: `${USERS_SHEET}!A:G` 
-    });
-    
-    const rows = usersResponse.data.values || [];
-    const rowIndex = rows.findIndex(row => row[1] === userData.email);
-    
-    if (rowIndex === -1) {
-        return res.status(404).json({ error: "Felhasználó nem található." });
-    }
-    
-    // JSON stringgé alakítás
-    const achievementsJson = JSON.stringify(achievements);
-    const badgeValue = badge || '';
-    
-    // F és G oszlop frissítése (index 5 és 6)
-    const range = `${USERS_SHEET}!F${rowIndex + 1}:G${rowIndex + 1}`;
-    
-    await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: range,
-        valueInputOption: 'USER_ENTERED',
-        resource: { values: [[achievementsJson, badgeValue]] }
-    });
-    
-    return res.status(200).json({ 
-        message: "Achievements sikeresen mentve!",
-        achievements: achievements,
-        badge: badgeValue
-    });
-}
-
-// 5. ÚJ (OPCIONÁLIS): GET_ACHIEVEMENTS - külön lekéréshez ha kell
-case 'GET_ACHIEVEMENTS': {
-    const userData = verifyUser(req);
-    
-    const usersResponse = await sheets.spreadsheets.values.get({ 
-        spreadsheetId: SPREADSHEET_ID, 
-        range: `${USERS_SHEET}!A:G` 
-    });
-    
-    const rows = usersResponse.data.values || [];
-    const userRow = rows.find(row => row[1] === userData.email);
-    
-    if (!userRow) {
-        return res.status(404).json({ error: "Felhasználó nem található." });
-    }
-    
-    // Achievements és badge betöltése
-    let achievements = { unlocked: [] };
-    try {
-        if (userRow[5]) {
-            achievements = JSON.parse(userRow[5]);
-        }
-    } catch (e) {
-        console.warn("Achievements parse error:", e);
-    }
-    
-    const badge = userRow[6] || '';
-    
-    return res.status(200).json({ 
-        achievements: achievements,
-        badge: badge
-    });
-}
-            
-            case 'GET_USER_BEERS': {
-    const userData = verifyUser(req);
-    const beersResponse = await sheets.spreadsheets.values.get({ 
-        spreadsheetId: SPREADSHEET_ID, 
-        range: GUEST_BEERS_SHEET 
-    });
-    
-    const allRows = beersResponse.data.values || [];
-    
-    // === MIGRÁCIÓ: régi söröknél UUID pótlása ===
-    const oldToNewIdMap = {}; // { 'user-Heineken-2024-01-15': '1720000000000-abc123' }
-    const batchUpdates = [];
-
-    allRows.forEach((row, i) => {
-        if (row[13] === userData.email && !row[14]) {
-            const newId = `${Date.now()}${i}-${Math.random().toString(36).slice(2, 8)}`;
-            const oldFallbackId = `user-${(row[2]||'').replace(/\s+/g,'-')}-${row[0]||''}`;
-            
-            oldToNewIdMap[oldFallbackId] = newId;
-            row[14] = newId;
-
-            batchUpdates.push({
-                range: `${GUEST_BEERS_SHEET}!O${i + 1}`,
-                values: [[newId]]
-            });
-        }
-    });
-
-    // Ha van mit frissíteni
-    if (batchUpdates.length > 0) {
-        // 1. UUID-k mentése a sörökre
-        await sheets.spreadsheets.values.batchUpdate({
-            spreadsheetId: SPREADSHEET_ID,
-            resource: { valueInputOption: 'USER_ENTERED', data: batchUpdates }
-        });
-
-        // 2. Fogyasztásnapló régi ID-k frissítése
-        const consResponse = await sheets.spreadsheets.values.get({
-            spreadsheetId: SPREADSHEET_ID,
-            range: 'Fogyasztás napló!A:H'
-        });
-        const consRows = consResponse.data.values || [];
-        const consBatchUpdates = [];
-
-        consRows.forEach((row, i) => {
-            if (row[1] === userData.email && oldToNewIdMap[row[3]]) {
-                consBatchUpdates.push({
-                    range: `Fogyasztás napló!D${i + 1}`,
-                    values: [[oldToNewIdMap[row[3]]]]
-                });
-            }
-        });
-
-        if (consBatchUpdates.length > 0) {
-            await sheets.spreadsheets.values.batchUpdate({
-                spreadsheetId: SPREADSHEET_ID,
-                resource: { valueInputOption: 'USER_ENTERED', data: consBatchUpdates }
-            });
-        }
-    }
-    // ============================================
-
-    const userBeers = allRows
-        .filter(row => row[13] === userData.email)
-        .map(row => ({
-            id: row[14],
-            date: row[0],
-            beerName: row[2],
-            location: row[3],
-            type: row[4],
-            look: row[5] || 0,
-            smell: row[6] || 0,
-            taste: row[7] || 0,
-            beerPercentage: row[8] || 0,
-            totalScore: row[9] || 0,
-            avg: row[10] || 0,
-            notes: row[11] || ''
-        }));
-
-    return res.status(200).json(userBeers);
-}
-
-            case 'ADD_USER_BEER': {
-                const userData = verifyUser(req);
-                const { beerName, type, location, beerPercentage, look, smell, taste, notes } = req.body;
-                
-                const numLook = parseFloat(look) || 0;
-                const numSmell = parseFloat(smell) || 0;
-                const numTaste = parseFloat(taste) || 0;
-                const numPercentage = parseFloat(beerPercentage) || 0;
-                
-                const totalScore = numLook + numSmell + numTaste;
-                const avgScore = (totalScore / 3).toFixed(2).replace('.', ',');
-                const beerId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-                
-                // JAVÍTOTT SORREND:
-                const newRow = [
-                new Date().toISOString().replace('T', ' ').substring(0, 19), // A: Dátum
-                userData.name,   // B: Név
-                beerName,        // C: Sör neve
-                location,        // D: Főzési hely
-                type,            // E: Típus
-                look,            // F: Külalak
-                smell,           // G: Illat
-                taste,           // H: Íz
-                // --- ITT VAN A HIBA, EZT KELL CSERÉLNI: ---
-                numPercentage,   // I: Alkohol % (Ide kerüljön a százalék!)
-                totalScore,      // J: Összpontszám (Ide a pontszám!)
-                avgScore,        // K: Átlag (Ide az átlag!)
-                // ------------------------------------------
-                notes || '',     // L: Jegyzetek
-                'Nem',           // M: Jóváhagyva?
-                userData.email,  // N: Email
-                beerId           //O: Stabil ID
-            ];
-                
-                await sheets.spreadsheets.values.append({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: GUEST_BEERS_SHEET,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: [newRow] },
-                });
-                await updateUserStreak(sheets, SPREADSHEET_ID, userData.email);
-                return res.status(201).json({ message: "Sikeres hozzáadás! (Streak frissítve)" });
             }
 
             case 'CHANGE_PASSWORD': {
@@ -1017,326 +415,755 @@ case 'GET_ACHIEVEMENTS': {
                 const { oldPassword, newPassword } = req.body;
                 if (!oldPassword || !newPassword) return res.status(400).json({ error: "Minden mező kitöltése kötelező!" });
 
-                const usersResponse = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${USERS_SHEET}!A:C` });
-                const allUsers = usersResponse.data.values || [];
-                const userIndex = allUsers.findIndex(row => row[1] === userData.email);
+                const rows = must(await db().from('users')
+                    .select('id,password_hash').eq('email', userData.email).limit(1));
+                if (!rows || rows.length === 0) return res.status(404).json({ error: "Felhasználó nem található." });
 
-                if (userIndex === -1) return res.status(404).json({ error: "Felhasználó nem található." });
-
-                const userRow = allUsers[userIndex];
-                const isPasswordValid = await bcrypt.compare(oldPassword, userRow[2]);
+                const isPasswordValid = await bcrypt.compare(oldPassword, rows[0].password_hash || '');
                 if (!isPasswordValid) return res.status(401).json({ error: "A jelenlegi jelszó hibás." });
 
-                const newHashedPassword = await bcrypt.hash(newPassword, 10);
-                const updateRange = `${USERS_SHEET}!C${userIndex + 1}`;
+                must(await db().from('users')
+                    .update({ password_hash: await bcrypt.hash(newPassword, 10) })
+                    .eq('id', rows[0].id));
 
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: updateRange,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: [[newHashedPassword]] },
-                });
-                
                 return res.status(200).json({ message: "Jelszó sikeresen módosítva!" });
             }
 
+            case 'REFRESH_USER_DATA': {
+                const userData = verifyUser(req);
+                const rows = must(await db().from('users')
+                    .select('current_streak,longest_streak,achievements,badge,settings')
+                    .eq('email', userData.email).limit(1));
+                if (!rows || rows.length === 0) return res.status(404).json({ error: "User not found" });
 
-                case 'GET_USER_DRINKS': {
-        const userData = verifyUser(req);
-        const drinksResponse = await sheets.spreadsheets.values.get({ 
-            spreadsheetId: SPREADSHEET_ID, 
-            range: GUEST_DRINKS_SHEET 
-        });
-        const userDrinks = drinksResponse.data.values
-            ?.filter(row => row[13] === userData.email) // N oszlop: Email
-            .map(row => ({
-                date: row[0],           // A: Dátum
-                drinkName: row[2],      // C: Ital Neve
-                category: row[3],       // D: Kategória
-                type: row[4],           // E: Típus
-                location: row[5],       // F: Hely
-                drinkPercentage: row[6] || 0, // G: Alkohol %
-                look: row[7] || 0,      // H: Külalak
-                smell: row[8] || 0,     // I: Illat
-                taste: row[9] || 0,     // J: Íz
-                totalScore: row[10] || 0, // K: Összpontszám
-                avg: row[11] || 0,      // L: Átlag
-                notes: row[12] || ''    // M: Megjegyzés
-            })) || [];
-        return res.status(200).json(userDrinks);
-    }
-    
-    case 'ADD_USER_DRINK': {
-        const userData = verifyUser(req);
-        const { drinkName, category, type, location, drinkPercentage, look, smell, taste, notes } = req.body;
-        
-        const numLook = parseFloat(look) || 0;
-        const numSmell = parseFloat(smell) || 0;
-        const numTaste = parseFloat(taste) || 0;
-        const numPercentage = parseFloat(drinkPercentage) || 0;
-        
-        const totalScore = numLook + numSmell + numTaste;
-        const avgScore = (totalScore / 3).toFixed(2).replace('.', ',');
-        
-        const newRow = [
-            new Date().toISOString().replace('T', ' ').substring(0, 19), // A: Dátum
-            userData.name,      // B: Beküldő Neve
-            drinkName,          // C: Ital Neve
-            category,           // D: Kategória
-            type,               // E: Típus
-            location,           // F: Hely
-            numPercentage,      // G: Alkohol %
-            look,               // H: Külalak
-            smell,              // I: Illat
-            taste,              // J: Íz
-            totalScore,         // K: Összpontszám
-            avgScore,           // L: Átlag
-            notes || '',        // M: Megjegyzés
-            userData.email      // N: Email
-        ];
-        
-        await sheets.spreadsheets.values.append({
-            spreadsheetId: SPREADSHEET_ID,
-            range: GUEST_DRINKS_SHEET,
-            valueInputOption: 'USER_ENTERED',
-            resource: { values: [newRow] },
-        });
-        await updateUserStreak(sheets, SPREADSHEET_ID, userData.email);
-        return res.status(201).json({ message: "Sikeres hozzáadás! (Streak frissítve)" });
-    }
+                const u = rows[0];
+                return res.status(200).json({
+                    streak: { current: u.current_streak || 0, longest: u.longest_streak || 0 },
+                    achievements: asObject(u.achievements, { unlocked: [] }),
+                    badge: u.badge || '',
+                    settings: asObject(u.settings, {})
+                });
+            }
+
+            case 'SAVE_SETTINGS': {
+                const userData = verifyUser(req);
+                const { settings } = req.body;
+                if (!settings) return res.status(400).json({ error: "Nincs beállítás adat." });
+
+                const upd = must(await db().from('users')
+                    .update({ settings }).eq('email', userData.email).select('id'));
+                if (!upd || upd.length === 0) return res.status(404).json({ error: "Felhasználó nem található." });
+
+                return res.status(200).json({ message: "Beállítások mentve." });
+            }
+
+            case 'UPDATE_ACHIEVEMENTS': {
+                const userData = verifyUser(req);
+                const { achievements, badge } = req.body;
+                if (!achievements || typeof achievements !== 'object') {
+                    return res.status(400).json({ error: "Hibás achievements formátum!" });
+                }
+
+                const badgeValue = badge || '';
+                const upd = must(await db().from('users')
+                    .update({ achievements, badge: badgeValue })
+                    .eq('email', userData.email).select('id'));
+                if (!upd || upd.length === 0) return res.status(404).json({ error: "Felhasználó nem található." });
+
+                return res.status(200).json({
+                    message: "Achievements sikeresen mentve!",
+                    achievements,
+                    badge: badgeValue
+                });
+            }
+
+            case 'GET_ACHIEVEMENTS': {
+                const userData = verifyUser(req);
+                const rows = must(await db().from('users')
+                    .select('achievements,badge').eq('email', userData.email).limit(1));
+                if (!rows || rows.length === 0) return res.status(404).json({ error: "Felhasználó nem található." });
+
+                return res.status(200).json({
+                    achievements: asObject(rows[0].achievements, { unlocked: [] }),
+                    badge: rows[0].badge || ''
+                });
+            }
+
+            // ==========================================================
+            // === SÖRÖK ===
+            // A frontend `index`-e a FELHASZNÁLÓ SAJÁT listájában elfoglalt
+            // pozíció (a modálok tömbindexként használják), ezért itt
+            // mindenhol ugyanaz a rendezés: id szerint növekvő = beküldési sorrend.
+            // ==========================================================
+
+            case 'GET_USER_BEERS': {
+                const userData = verifyUser(req);
+                const rows = must(await db().from('user_beers')
+                    .select('*').eq('user_email', userData.email).order('id', { ascending: true }));
+
+                // Régi soroknál pótoljuk a hiányzó stabil azonosítót (a Sheets-verzió is ezt tette),
+                // és átvezetjük a fogyasztásnaplóra is, hogy a statisztika ne szakadjon el.
+                const missing = (rows || []).filter(r => !r.beer_uid);
+                if (missing.length > 0) {
+                    const oldToNew = {};
+                    for (const r of missing) {
+                        const newId = `${Date.now()}${r.id}-${Math.random().toString(36).slice(2, 8)}`;
+                        const oldFallbackId = `user-${String(r.beer_name || '').replace(/\s+/g, '-')}-${r.date_text || ''}`;
+                        oldToNew[oldFallbackId] = newId;
+                        r.beer_uid = newId;
+                        must(await db().from('user_beers').update({ beer_uid: newId }).eq('id', r.id));
+                    }
+                    for (const [oldId, newId] of Object.entries(oldToNew)) {
+                        await db().from('consumptions')
+                            .update({ beer_uid: newId })
+                            .eq('user_email', userData.email).eq('beer_uid', oldId);
+                    }
+                }
+
+                const userBeers = (rows || []).map(r => ({
+                    id: r.beer_uid,
+                    date: r.date_text,
+                    beerName: r.beer_name,
+                    location: r.location,
+                    type: r.type,
+                    look: r.look || 0,
+                    smell: r.smell || 0,
+                    taste: r.taste || 0,
+                    beerPercentage: r.beer_percentage || 0,
+                    totalScore: r.total_score || 0,
+                    avg: r.avg || 0,
+                    notes: r.notes || ''
+                }));
+
+                return res.status(200).json(userBeers);
+            }
+
+            case 'ADD_USER_BEER': {
+                const userData = verifyUser(req);
+                const { beerName, type, location, beerPercentage, look, smell, taste, notes } = req.body;
+
+                const numLook = parseFloat(look) || 0;
+                const numSmell = parseFloat(smell) || 0;
+                const numTaste = parseFloat(taste) || 0;
+                const totalScore = numLook + numSmell + numTaste;
+
+                must(await db().from('user_beers').insert([{
+                    beer_uid: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                    date_text: nowText(),
+                    submitter_name: userData.name,
+                    beer_name: beerName,
+                    location: location || '',
+                    type: type || '',
+                    look: numLook, smell: numSmell, taste: numTaste,
+                    beer_percentage: parseFloat(beerPercentage) || 0,
+                    total_score: totalScore,
+                    avg: avgOf(totalScore),
+                    notes: notes || '',
+                    approved: 'Nem',
+                    user_email: userData.email
+                }]));
+
+                await updateUserStreak(userData.email);
+                return res.status(201).json({ message: "Sikeres hozzáadás! (Streak frissítve)" });
+            }
 
             case 'EDIT_USER_BEER': {
-    const userData = verifyUser(req);
-    const { index, beerName, type, location, beerPercentage, look, smell, taste, notes } = req.body;
-    
-    
-    const beersResponse = await sheets.spreadsheets.values.get({ 
-        spreadsheetId: SPREADSHEET_ID, 
-        range: GUEST_BEERS_SHEET 
-    });
-    
-    const allRows = beersResponse.data.values || [];
-    const userRows = allRows.filter(row => row[13] === userData.email);
-    
-    if (index < 0 || index >= userRows.length) {
-        return res.status(400).json({ error: "Érvénytelen index" });
-    }
-    
-    const targetRow = userRows[index];
-    const globalIndex = allRows.indexOf(targetRow);
-    
-    const numLook = parseFloat(look) || 0;
-    const numSmell = parseFloat(smell) || 0;
-    const numTaste = parseFloat(taste) || 0;
-    const numPercentage = parseFloat(beerPercentage) || 0;
-    
-    const totalScore = numLook + numSmell + numTaste;
-    const avgScore = (totalScore / 3).toFixed(2).replace('.', ',');
-    const existingBeerId = targetRow[14] || `user-${(targetRow[2]||'').replace(/\s+/g,'-')}-${targetRow[0]||''}`;
+                const userData = verifyUser(req);
+                const { index, beerName, type, location, beerPercentage, look, smell, taste, notes } = req.body;
 
-    
-    const updatedRow = [
-    targetRow[0],    // A: Dátum
-    userData.name,   // B: Név
-    beerName,        // C: Sör neve
-    location,        // D: Főzési hely
-    type,            // E: Típus
-    look,            // F: Külalak
-    smell,           // G: Illat
-    taste,           // H: Íz
-    // --- ITT IS CSERÉLNI KELL: ---
-    numPercentage,   // I: Alkohol % 
-    totalScore,      // J: Összpontszám
-    avgScore,        // J: Átlag
-    // -----------------------------
-    notes || '',     // L: Jegyzetek
-    targetRow[12],   // M: Jóváhagyva?
-    userData.email,   // N: Email
-    existingBeerId    // O: UUID
-];
-    const range = `${GUEST_BEERS_SHEET}!A${globalIndex + 1}:O${globalIndex + 1}`;
-    await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: range,
-        valueInputOption: 'USER_ENTERED',
-        resource: { values: [updatedRow] }
-    });
-    
-    return res.status(200).json({ message: "Sör sikeresen módosítva!" });
-}
+                const rows = must(await db().from('user_beers')
+                    .select('id').eq('user_email', userData.email).order('id', { ascending: true }));
+                if (index < 0 || index >= (rows || []).length) {
+                    return res.status(400).json({ error: "Érvénytelen index" });
+                }
 
-case 'EDIT_USER_DRINK': {
-    const userData = verifyUser(req);
-    const { index, drinkName, category, type, location, drinkPercentage, look, smell, taste, notes } = req.body;
-    
-    const drinksResponse = await sheets.spreadsheets.values.get({ 
-        spreadsheetId: SPREADSHEET_ID, 
-        range: GUEST_DRINKS_SHEET 
-    });
-    
-    const allRows = drinksResponse.data.values || [];
-    const userRows = allRows.filter(row => row[13] === userData.email);
-    
-    if (index < 0 || index >= userRows.length) {
-        return res.status(400).json({ error: "Érvénytelen index" });
-    }
-    
-    const targetRow = userRows[index];
-    const globalIndex = allRows.indexOf(targetRow);
-    
-    const numLook = parseFloat(look) || 0;
-    const numSmell = parseFloat(smell) || 0;
-    const numTaste = parseFloat(taste) || 0;
-    const numPercentage = parseFloat(drinkPercentage) || 0;
-    
-    const totalScore = numLook + numSmell + numTaste;
-    const avgScore = (totalScore / 3).toFixed(2).replace('.', ',');
-    
-    const updatedRow = [
-        targetRow[0],       // A: Dátum (megtartjuk az eredetit)
-        userData.name,      // B: Beküldő Neve
-        drinkName,          // C: Ital Neve
-        category,           // D: Kategória
-        type,               // E: Típus
-        location,           // F: Hely
-        numPercentage,      // G: Alkohol %
-        look,               // H: Külalak
-        smell,              // I: Illat
-        taste,              // J: Íz
-        totalScore,         // K: Összpontszám
-        avgScore,           // L: Átlag
-        notes || '',        // M: Megjegyzés
-        userData.email      // N: Email
-    ];
-    
-    const range = `${GUEST_DRINKS_SHEET}!A${globalIndex + 1}:N${globalIndex + 1}`;
-    await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: range,
-        valueInputOption: 'USER_ENTERED',
-        resource: { values: [updatedRow] }
-    });
-    
-    return res.status(200).json({ message: "Ital sikeresen módosítva!" });
-}
+                const numLook = parseFloat(look) || 0;
+                const numSmell = parseFloat(smell) || 0;
+                const numTaste = parseFloat(taste) || 0;
+                const totalScore = numLook + numSmell + numTaste;
 
-            // === ÖTLETAJÁNLÓ API ===
-            
-           case 'SUBMIT_IDEA': {
+                must(await db().from('user_beers').update({
+                    submitter_name: userData.name,
+                    beer_name: beerName,
+                    location: location || '',
+                    type: type || '',
+                    look: numLook, smell: numSmell, taste: numTaste,
+                    beer_percentage: parseFloat(beerPercentage) || 0,
+                    total_score: totalScore,
+                    avg: avgOf(totalScore),
+                    notes: notes || ''
+                }).eq('id', rows[index].id));
+
+                return res.status(200).json({ message: "Sör sikeresen módosítva!" });
+            }
+
+            // Korábban: a teljes lap törlése (values.clear) és visszaírása.
+            // Most: egyetlen sor törlése, atomi művelet.
+            case 'DELETE_USER_BEER': {
+                const userData = verifyUser(req);
+                const { index } = req.body;
+
+                const rows = must(await db().from('user_beers')
+                    .select('id').eq('user_email', userData.email).order('id', { ascending: true }));
+                if (index < 0 || index >= (rows || []).length) {
+                    return res.status(400).json({ error: "Érvénytelen index" });
+                }
+
+                must(await db().from('user_beers').delete().eq('id', rows[index].id));
+                return res.status(200).json({ message: "Sör sikeresen törölve!" });
+            }
+
+            // ==========================================================
+            // === ITALOK ===
+            // ==========================================================
+
+            case 'GET_USER_DRINKS': {
+                const userData = verifyUser(req);
+                const rows = must(await db().from('user_drinks')
+                    .select('*').eq('user_email', userData.email).order('id', { ascending: true }));
+
+                const userDrinks = (rows || []).map(r => ({
+                    date: r.date_text,
+                    drinkName: r.drink_name,
+                    category: r.category,
+                    type: r.type,
+                    location: r.location,
+                    drinkPercentage: r.drink_percentage || 0,
+                    look: r.look || 0,
+                    smell: r.smell || 0,
+                    taste: r.taste || 0,
+                    totalScore: r.total_score || 0,
+                    avg: r.avg || 0,
+                    notes: r.notes || ''
+                }));
+
+                return res.status(200).json(userDrinks);
+            }
+
+            case 'ADD_USER_DRINK': {
+                const userData = verifyUser(req);
+                const { drinkName, category, type, location, drinkPercentage, look, smell, taste, notes } = req.body;
+
+                const numLook = parseFloat(look) || 0;
+                const numSmell = parseFloat(smell) || 0;
+                const numTaste = parseFloat(taste) || 0;
+                const totalScore = numLook + numSmell + numTaste;
+
+                must(await db().from('user_drinks').insert([{
+                    date_text: nowText(),
+                    submitter_name: userData.name,
+                    drink_name: drinkName,
+                    category: category || '',
+                    type: type || '',
+                    location: location || '',
+                    drink_percentage: parseFloat(drinkPercentage) || 0,
+                    look: numLook, smell: numSmell, taste: numTaste,
+                    total_score: totalScore,
+                    avg: avgOf(totalScore),
+                    notes: notes || '',
+                    user_email: userData.email
+                }]));
+
+                await updateUserStreak(userData.email);
+                return res.status(201).json({ message: "Sikeres hozzáadás! (Streak frissítve)" });
+            }
+
+            case 'EDIT_USER_DRINK': {
+                const userData = verifyUser(req);
+                const { index, drinkName, category, type, location, drinkPercentage, look, smell, taste, notes } = req.body;
+
+                const rows = must(await db().from('user_drinks')
+                    .select('id').eq('user_email', userData.email).order('id', { ascending: true }));
+                if (index < 0 || index >= (rows || []).length) {
+                    return res.status(400).json({ error: "Érvénytelen index" });
+                }
+
+                const numLook = parseFloat(look) || 0;
+                const numSmell = parseFloat(smell) || 0;
+                const numTaste = parseFloat(taste) || 0;
+                const totalScore = numLook + numSmell + numTaste;
+
+                must(await db().from('user_drinks').update({
+                    submitter_name: userData.name,
+                    drink_name: drinkName,
+                    category: category || '',
+                    type: type || '',
+                    location: location || '',
+                    drink_percentage: parseFloat(drinkPercentage) || 0,
+                    look: numLook, smell: numSmell, taste: numTaste,
+                    total_score: totalScore,
+                    avg: avgOf(totalScore),
+                    notes: notes || ''
+                }).eq('id', rows[index].id));
+
+                return res.status(200).json({ message: "Ital sikeresen módosítva!" });
+            }
+
+            case 'DELETE_USER_DRINK': {
+                const userData = verifyUser(req);
+                const { index } = req.body;
+
+                const rows = must(await db().from('user_drinks')
+                    .select('id').eq('user_email', userData.email).order('id', { ascending: true }));
+                if (index < 0 || index >= (rows || []).length) {
+                    return res.status(400).json({ error: "Érvénytelen index" });
+                }
+
+                must(await db().from('user_drinks').delete().eq('id', rows[index].id));
+                return res.status(200).json({ message: "Ital sikeresen törölve!" });
+            }
+
+            // ==========================================================
+            // === FOGYASZTÁS NAPLÓ ===
+            // ==========================================================
+
+            case 'ADD_CONSUMPTION': {
+                const userData = verifyUser(req);
+                const { beerName, beerId, qty, dlPerGlass, totalDl, abv } = req.body;
+
+                const owned = must(await db().from('user_beers')
+                    .select('id').eq('user_email', userData.email).eq('beer_name', beerName).limit(1));
+                if (!owned || owned.length === 0) {
+                    return res.status(403).json({ error: "Ez a sör nem a te listádban szerepel." });
+                }
+
+                must(await db().from('consumptions').insert([{
+                    date_text: nowText(),
+                    user_email: userData.email,
+                    beer_name: beerName,
+                    beer_uid: beerId || null,
+                    qty: numOr0(qty),
+                    dl_per_glass: numOr0(dlPerGlass),
+                    total_dl: numOr0(totalDl),
+                    abv: numOr0(abv)
+                }]));
+
+                return res.status(201).json({ message: 'Fogyasztás rögzítve!' });
+            }
+
+            case 'GET_CONSUMPTIONS': {
+                const userData = verifyUser(req);
+                const rows = must(await db().from('consumptions')
+                    .select('*').eq('user_email', userData.email).order('id', { ascending: true }));
+
+                const map = {};
+                (rows || []).forEach(r => {
+                    const key = r.beer_uid;
+                    if (!map[key]) map[key] = { count: 0, totalDl: 0 };
+                    map[key].count += parseInt(r.qty) || 0;
+                    map[key].totalDl += parseInt(r.total_dl) || 0;
+                });
+
+                const entries = (rows || []).map(r => ({
+                    date: r.date_text,
+                    beerName: r.beer_name,
+                    beerId: r.beer_uid,
+                    qty: parseInt(r.qty) || 0,
+                    dlPerGlass: parseInt(r.dl_per_glass) || 0,
+                    totalDl: parseInt(r.total_dl) || 0,
+                    abv: numOr0(r.abv)
+                }));
+
+                return res.status(200).json({ map, entries });
+            }
+
+            // ==========================================================
+            // === ADATIMPORT (duplikátum-szűréssel) ===
+            // ==========================================================
+
+            case 'IMPORT_USER_DATA': {
+                const userData = verifyUser(req);
+                const { beers, drinks } = req.body;
+
+                if ((!beers || beers.length === 0) && (!drinks || drinks.length === 0)) {
+                    return res.status(400).json({ error: "Nincs importálható adat!" });
+                }
+
+                const normalizeDateToString = (date) => {
+                    if (!date) return '';
+                    if (typeof date === 'string') {
+                        if (date.includes('T')) return date.substring(0, 10);
+                        if (date.includes('.')) {
+                            const parts = date.split('.').map(p => p.trim()).filter(Boolean);
+                            if (parts.length >= 3) {
+                                return `${parts[0].padStart(4, '0')}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+                            }
+                        }
+                        return date.substring(0, 10);
+                    }
+                    if (date instanceof Date) return date.toISOString().substring(0, 10);
+                    if (typeof date === 'number') {
+                        const excelEpoch = new Date(1900, 0, 1);
+                        return new Date(excelEpoch.getTime() + (date - 2) * 86400000).toISOString().substring(0, 10);
+                    }
+                    return '';
+                };
+
+                let addedBeersCount = 0, addedDrinksCount = 0, skippedCount = 0;
+
+                if (beers && beers.length > 0) {
+                    const existing = must(await db().from('user_beers')
+                        .select('date_text,beer_name,location,total_score').eq('user_email', userData.email));
+
+                    const fp = (date, name, loc, score) =>
+                        `${normalizeDateToString(date)}|${String(name || '').trim().toLowerCase()}|${String(loc || '').trim().toLowerCase()}|${score}`;
+                    const seen = new Set((existing || []).map(r => fp(r.date_text, r.beer_name, r.location, r.total_score)));
+
+                    const newRows = [];
+                    beers.forEach(beer => {
+                        const look = parseFloat(beer.look) || 0;
+                        const smell = parseFloat(beer.smell) || 0;
+                        const taste = parseFloat(beer.taste) || 0;
+                        const totalScore = look + smell + taste;
+                        const dateStr = beer.date
+                            ? normalizeDateToString(beer.date) + ' 12:00:00'
+                            : nowText();
+
+                        const key = fp(dateStr, beer.beerName, beer.location || '', totalScore);
+                        if (seen.has(key)) { skippedCount++; return; }
+                        seen.add(key);
+
+                        newRows.push({
+                            beer_uid: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${newRows.length}`,
+                            date_text: dateStr,
+                            submitter_name: userData.name,
+                            beer_name: beer.beerName,
+                            location: beer.location || '',
+                            type: beer.type || '',
+                            look, smell, taste,
+                            beer_percentage: parseFloat(beer.beerPercentage) || 0,
+                            total_score: totalScore,
+                            avg: avgOf(totalScore),
+                            notes: beer.notes || '',
+                            approved: 'Nem',
+                            user_email: userData.email
+                        });
+                        addedBeersCount++;
+                    });
+
+                    if (newRows.length > 0) must(await db().from('user_beers').insert(newRows));
+                }
+
+                if (drinks && drinks.length > 0) {
+                    const existing = must(await db().from('user_drinks')
+                        .select('date_text,drink_name,category,total_score').eq('user_email', userData.email));
+
+                    const fp = (date, name, cat, score) =>
+                        `${normalizeDateToString(date)}|${String(name || '').trim().toLowerCase()}|${String(cat || '').trim().toLowerCase()}|${score}`;
+                    const seen = new Set((existing || []).map(r => fp(r.date_text, r.drink_name, r.category, r.total_score)));
+
+                    const newRows = [];
+                    drinks.forEach(drink => {
+                        const look = parseFloat(drink.look) || 0;
+                        const smell = parseFloat(drink.smell) || 0;
+                        const taste = parseFloat(drink.taste) || 0;
+                        const totalScore = look + smell + taste;
+                        const dateStr = drink.date
+                            ? normalizeDateToString(drink.date) + ' 12:00:00'
+                            : nowText();
+
+                        const key = fp(dateStr, drink.drinkName, drink.category || 'Egyéb', totalScore);
+                        if (seen.has(key)) { skippedCount++; return; }
+                        seen.add(key);
+
+                        newRows.push({
+                            date_text: dateStr,
+                            submitter_name: userData.name,
+                            drink_name: drink.drinkName,
+                            category: drink.category || 'Egyéb',
+                            type: drink.type || 'Alkoholos',
+                            location: drink.location || '',
+                            drink_percentage: parseFloat(drink.drinkPercentage) || 0,
+                            look, smell, taste,
+                            total_score: totalScore,
+                            avg: avgOf(totalScore),
+                            notes: drink.notes || '',
+                            user_email: userData.email
+                        });
+                        addedDrinksCount++;
+                    });
+
+                    if (newRows.length > 0) must(await db().from('user_drinks').insert(newRows));
+                }
+
+                return res.status(200).json({
+                    message: `Sikeres importálás! (+${addedBeersCount} sör, +${addedDrinksCount} ital). ${skippedCount} duplikáció átugorva.`
+                });
+            }
+
+            // ==========================================================
+            // === ÖTLETEK ===
+            // A frontend `index`-e itt átlátszatlan azonosító: a GET adja,
+            // és változatlanul küldi vissza. Ezért a sor valódi adatbázis-
+            // azonosítóját használjuk — így nem tud elcsúszni másik sorra.
+            // ==========================================================
+
+            case 'SUBMIT_IDEA': {
                 const userData = verifyUser(req);
                 const { ideaText, isAnonymous } = req.body;
-                
                 if (!ideaText || ideaText.trim() === '') {
                     return res.status(400).json({ error: "Az ötlet nem lehet üres!" });
                 }
-                
-                // JAVÍTÁS: A név lehet Anonymous, de az emailt elmentjük a törléshez!
-                const submitterName = isAnonymous ? 'Anonymous' : userData.name;
-                const userEmail = userData.email; // MINDIG a valódi emailt mentjük!
-                
-                const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
-                const date = new Date().toLocaleDateString('hu-HU');
-                
-                // Sorrend: A:Beküldő, B:Ötlet, C:Időpont, D:Státusz, E:Dátum, F:Email
-                const newRow = [
-                    submitterName,           
-                    ideaText,                
-                    timestamp,               
-                    'Megcsinálásra vár',     
-                    date,                    
-                    userEmail // Itt most már a valódi email lesz
-                ];
 
-                await sheets.spreadsheets.values.append({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `${IDEAS_SHEET}!A:F`,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: [newRow] }
-                });
+                must(await db().from('ideas').insert([{
+                    submitter_name: isAnonymous ? 'Anonymous' : userData.name,
+                    idea_text: ideaText,
+                    time_text: nowText(),
+                    status: 'Megcsinálásra vár',
+                    date_text: new Date().toLocaleDateString('hu-HU'),
+                    user_email: userData.email,
+                    vote_count: 0,
+                    voters: []
+                }]));
+
                 return res.status(201).json({ message: "Köszönjük az ötleted! 💡" });
             }
 
-            
-            case 'SUBMIT_SUPPORT_TICKET': {
-    // Ez a funkció NEM igényel bejelentkezést, de ha van token, használjuk
-    let userData = null;
-    try {
-        userData = verifyUser(req);
-    } catch (error) {
-        // Nincs token vagy érvénytelen - ez OK, mert vendégek is használhatják
-        console.log("Vendég felhasználó küldte a hibajelentést");
-    }
-    
-    const { name, email, subject, message } = req.body;
-    
-    // Validálás
-    if (!name || !email || !subject || !message) {
-        return res.status(400).json({ error: "Minden mező kitöltése kötelező!" });
-    }
-    
-    // Email validáció
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-        return res.status(400).json({ error: "Érvénytelen email cím!" });
-    }
-    
-    const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
-    const date = new Date().toLocaleDateString('hu-HU');
-    
-    // Google Sheets sor összeállítása
-    // Oszlopok: A:Dátum, B:Beküldő Neve, C:Beküldő Email, D:Tárgy, E:Üzenet, F:Státusz
-    const newRow = [
-        date,           // A: Dátum
-        name,           // B: Beküldő Neve
-        email,          // C: Beküldő Email
-        subject,        // D: Tárgy
-        message,        // E: Üzenet
-        'Új'            // F: Státusz (alapértelmezett: "Új")
-    ];
-    
-    await sheets.spreadsheets.values.append({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `Hibajelentések!A:F`,
-        valueInputOption: 'USER_ENTERED',
-        resource: { values: [newRow] }
-    });
-    
-    return res.status(201).json({ 
-        message: "Hibajelentésed sikeresen elküldve! Hamarosan válaszolunk az emaileden keresztül. 📧" 
-    });
-}
+            case 'GET_ALL_IDEAS': {
+                const userData = verifyUser(req);
 
-            
+                const [ideaRows, userRows] = await Promise.all([
+                    db().from('ideas').select('*').order('id', { ascending: true }),
+                    db().from('users').select('email,badge')
+                ]).then(r => r.map(must));
+
+                const userBadges = {};
+                (userRows || []).forEach(u => { if (u.email && u.badge) userBadges[u.email] = u.badge; });
+
+                const ideas = (ideaRows || []).map(r => {
+                    const storedEmail = r.user_email || '';
+                    const submitterName = r.submitter_name || 'Névtelen';
+                    const voters = asArray(r.voters);
+
+                    return {
+                        index: r.id,
+                        submitter: submitterName,
+                        idea: r.idea_text || 'Nincs szöveg',
+                        timestamp: r.time_text || '',
+                        status: r.status || 'Megcsinálásra vár',
+                        date: r.date_text || '',
+                        email: userData.isAdmin ? storedEmail : undefined,
+                        isMine: storedEmail === userData.email,
+                        badge: (submitterName !== 'Anonymous' && userBadges[storedEmail]) ? userBadges[storedEmail] : '',
+                        voteCount: r.vote_count || 0,
+                        hasVoted: voters.includes(userData.email)
+                    };
+                });
+
+                ideas.sort((a, b) => b.voteCount - a.voteCount);
+                return res.status(200).json(ideas);
+            }
+
+            case 'UPDATE_IDEA_STATUS': {
+                const userData = verifyUser(req);
+                if (!userData.isAdmin) return res.status(403).json({ error: "Nincs jogosultságod ehhez a művelethez. 🚫" });
+                const { index, newStatus } = req.body;
+                if (index === undefined || index === null) return res.status(400).json({ error: "Hiányzó index!" });
+
+                const upd = must(await db().from('ideas')
+                    .update({ status: newStatus }).eq('id', parseInt(index)).select('id'));
+                if (!upd || upd.length === 0) return res.status(404).json({ error: "Az ötlet nem található." });
+
+                return res.status(200).json({ message: "Státusz sikeresen frissítve! ✅" });
+            }
+
+            // A frontend itt NEM az ötlet azonosítóját küldi, hanem a saját,
+            // még függőben lévő ötletei közti sorszámot — ezt a szemantikát tartjuk.
+            case 'DELETE_USER_IDEA': {
+                const userData = verifyUser(req);
+                const { index } = req.body;
+
+                const rows = must(await db().from('ideas')
+                    .select('id').eq('user_email', userData.email)
+                    .neq('status', 'Megcsinálva').order('id', { ascending: true }));
+
+                if (index < 0 || index >= (rows || []).length) {
+                    return res.status(400).json({ error: "Érvénytelen index vagy már nem törölhető!" });
+                }
+
+                must(await db().from('ideas').delete().eq('id', rows[index].id));
+                return res.status(200).json({ message: "Ötlet és a hozzá tartozó szavazatok sikeresen törölve!" });
+            }
+
+            // ==========================================================
+            // === AJÁNLÁSOK ===
+            // ==========================================================
+
+            case 'ADD_RECOMMENDATION': {
+                const userData = verifyUser(req);
+                const { itemName, itemType, category, description, isAnonymous } = req.body;
+                if (!itemName || !itemType) return res.status(400).json({ error: "Név és típus kötelező!" });
+
+                must(await db().from('recommendations').insert([{
+                    date_text: nowText(),
+                    name: userData.name,
+                    user_email: userData.email,
+                    item_name: itemName,
+                    item_type: itemType,
+                    description: description || '',
+                    is_anonymous: !!isAnonymous,
+                    category: category || 'Egyéb',
+                    is_edited: false,
+                    vote_count: 0,
+                    voters: []
+                }]));
+
+                return res.status(201).json({ message: "Ajánlás sikeresen beküldve! 📢" });
+            }
+
+            case 'GET_RECOMMENDATIONS': {
+                const userData = verifyUser(req);
+
+                const [recRows, userRows] = await Promise.all([
+                    db().from('recommendations').select('*').order('id', { ascending: true }),
+                    db().from('users').select('email,badge')
+                ]).then(r => r.map(must));
+
+                const userBadges = {};
+                (userRows || []).forEach(u => { if (u.email && u.badge) userBadges[u.email] = u.badge; });
+
+                const recommendations = (recRows || []).map(r => {
+                    const isAnon = !!r.is_anonymous;
+                    const email = r.user_email;
+                    const voters = asArray(r.voters);
+
+                    return {
+                        originalIndex: r.id,
+                        date: r.date_text ? String(r.date_text).substring(0, 10) : '',
+                        submitter: isAnon ? 'Anonymus 🕵️' : (r.name || 'Ismeretlen'),
+                        badge: isAnon ? '' : (userBadges[email] || ''),
+                        itemName: r.item_name,
+                        type: r.item_type,
+                        description: r.description || '',
+                        isAnon,
+                        category: r.category || 'Egyéb',
+                        isEdited: !!r.is_edited,
+                        isMine: email === userData.email,
+                        voteCount: r.vote_count || 0,
+                        hasVoted: voters.includes(userData.email)
+                    };
+                });
+
+                recommendations.sort((a, b) => b.voteCount - a.voteCount);
+                return res.status(200).json(recommendations);
+            }
+
+            case 'EDIT_RECOMMENDATION': {
+                const userData = verifyUser(req);
+                const { originalIndex, itemName, itemType, category, description, isAnonymous } = req.body;
+
+                const rows = must(await db().from('recommendations')
+                    .select('id,user_email').eq('id', parseInt(originalIndex)).limit(1));
+                if (!rows || rows.length === 0) return res.status(404).json({ error: "Az ajánlás nem található." });
+                if (rows[0].user_email !== userData.email) {
+                    return res.status(403).json({ error: "Csak a saját ajánlásodat módosíthatod!" });
+                }
+
+                must(await db().from('recommendations').update({
+                    item_name: itemName,
+                    item_type: itemType,
+                    description: description,
+                    is_anonymous: !!isAnonymous,
+                    category: category,
+                    is_edited: true
+                }).eq('id', rows[0].id));
+
+                return res.status(200).json({ message: "Ajánlás sikeresen módosítva!" });
+            }
+
+            case 'DELETE_USER_RECOMMENDATION': {
+                const userData = verifyUser(req);
+                const { originalIndex } = req.body;
+
+                const rows = must(await db().from('recommendations')
+                    .select('id,user_email').eq('id', parseInt(originalIndex)).limit(1));
+                if (!rows || rows.length === 0) return res.status(404).json({ error: "Az ajánlás nem található." });
+                if (rows[0].user_email !== userData.email) {
+                    return res.status(403).json({ error: "Csak a saját ajánlásodat törölheted!" });
+                }
+
+                must(await db().from('recommendations').delete().eq('id', rows[0].id));
+                return res.status(200).json({ message: "Ajánlás és a hozzá tartozó szavazatok sikeresen törölve!" });
+            }
+
+            // === SZAVAZÁS ===
+            case 'VOTE_CONTENT': {
+                const userData = verifyUser(req);
+                const { type, index } = req.body;
+
+                let table;
+                if (type === 'idea') table = 'ideas';
+                else if (type === 'recommendation') table = 'recommendations';
+                else return res.status(400).json({ error: "Ismeretlen típus" });
+
+                const rows = must(await db().from(table)
+                    .select('id,vote_count,voters').eq('id', parseInt(index)).limit(1));
+                if (!rows || rows.length === 0) return res.status(404).json({ error: "A tartalom nem található." });
+
+                let voters = asArray(rows[0].voters);
+                let currentCount = rows[0].vote_count || 0;
+                const userEmail = userData.email;
+
+                if (voters.includes(userEmail)) {
+                    voters = voters.filter(e => e !== userEmail);
+                    currentCount = Math.max(0, currentCount - 1);
+                } else {
+                    voters.push(userEmail);
+                    currentCount++;
+                }
+
+                must(await db().from(table)
+                    .update({ vote_count: currentCount, voters }).eq('id', rows[0].id));
+
+                return res.status(200).json({
+                    message: "Szavazat rögzítve",
+                    newCount: currentCount,
+                    voted: voters.includes(userEmail)
+                });
+            }
+
+            // ==========================================================
+            // === HIBAJELENTÉSEK (support) ===
+            // ==========================================================
+
+            case 'SUBMIT_SUPPORT_TICKET': {
+                // Bejelentkezés nélkül is használható (vendégek is küldhetnek).
+                try { verifyUser(req); } catch (e) { /* vendég — rendben */ }
+
+                const { name, email, subject, message } = req.body;
+                if (!name || !email || !subject || !message) {
+                    return res.status(400).json({ error: "Minden mező kitöltése kötelező!" });
+                }
+                if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                    return res.status(400).json({ error: "Érvénytelen email cím!" });
+                }
+
+                must(await db().from('support_tickets').insert([{
+                    date_text: new Date().toLocaleDateString('hu-HU'),
+                    name, user_email: email, subject, message, status: 'Új'
+                }]));
+
+                return res.status(201).json({
+                    message: "Hibajelentésed sikeresen elküldve! Hamarosan válaszolunk az emaileden keresztül. 📧"
+                });
+            }
 
             case 'GET_SUPPORT_TICKETS': {
                 const userData = verifyUser(req);
                 if (!userData.isAdmin) return res.status(403).json({ error: "Nincs jogosultságod ehhez a művelethez. 🚫" });
-                // Csak admin férhet hozzá!
-                // (Feltételezzük, hogy az admin tokenben benne van az isAdmin: true, 
-                // vagy az email alapján ellenőrzöd, mint a többi helyen)
-                
-                const ticketsResponse = await sheets.spreadsheets.values.get({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `Hibajelentések!A:F` // A:Dátum, B:Név, C:Email, D:Tárgy, E:Üzenet, F:Státusz
-                });
 
-                const allRows = ticketsResponse.data.values || [];
-                
-                // Átalakítás objektumokká (kihagyjuk a fejlécet, ha van)
-                const tickets = allRows.map((row, index) => {
-                    if (index === 0 && row[0] === 'Dátum') return null; // Fejléc szűrés
-                    if (!row || row.length === 0) return null;
+                const rows = must(await db().from('support_tickets')
+                    .select('*').order('id', { ascending: true }));
 
-                    return {
-                        originalIndex: index, // Fontos a módosításhoz (Sor index - 1)
-                        date: row[0],
-                        name: row[1],
-                        email: row[2],
-                        subject: row[3],
-                        message: row[4],
-                        status: row[5] || 'Új'
-                    };
-                }).filter(item => item !== null).reverse(); // Legújabb elöl
+                const tickets = (rows || []).map(r => ({
+                    originalIndex: r.id,
+                    date: r.date_text,
+                    name: r.name,
+                    email: r.user_email,
+                    subject: r.subject,
+                    message: r.message,
+                    status: r.status || 'Új'
+                })).reverse(); // legújabb elöl
 
                 return res.status(200).json(tickets);
             }
@@ -1345,1195 +1172,281 @@ case 'EDIT_USER_DRINK': {
                 const userData = verifyUser(req);
                 if (!userData.isAdmin) return res.status(403).json({ error: "Nincs jogosultságod ehhez a művelethez. 🚫" });
                 const { originalIndex, newStatus } = req.body;
+                if (originalIndex === undefined || !newStatus) return res.status(400).json({ error: "Hiányzó adatok!" });
 
-                if (originalIndex === undefined || !newStatus) {
-                    return res.status(400).json({ error: "Hiányzó adatok!" });
-                }
-
-                // A Sheetben a sor indexe: originalIndex + 1 (mivel a tömb 0-tól indul, sheet 1-től)
-                const rowIndex = parseInt(originalIndex) + 1;
-                const range = `Hibajelentések!F${rowIndex}`; // F oszlop a Státusz
-
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: range,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: [[newStatus]] }
-                });
+                const upd = must(await db().from('support_tickets')
+                    .update({ status: newStatus }).eq('id', parseInt(originalIndex)).select('id'));
+                if (!upd || upd.length === 0) return res.status(404).json({ error: "A hibajelentés nem található." });
 
                 return res.status(200).json({ message: "Státusz sikeresen frissítve! ✅" });
             }
-            
-            case 'GET_ALL_IDEAS': {
+
+            // ==========================================================
+            // === MODERÁCIÓ ===
+            // ==========================================================
+
+            case 'REPORT_CONTENT': {
                 const userData = verifyUser(req);
-                
-                const ideasResponse = await sheets.spreadsheets.values.get({
-                    spreadsheetId: SPREADSHEET_ID,
-                    // Bővítettük A:H-ra (G=Count, H=Voters)
-                    range: `${IDEAS_SHEET}!A:H` 
-                });
-                
-                const usersResponse = await sheets.spreadsheets.values.get({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `${USERS_SHEET}!A:G`
-                });
-                
-                const allRows = ideasResponse.data.values || [];
-                const allUsers = usersResponse.data.values || [];
+                const { type, contentId, reason } = req.body;
 
-                const userBadges = {};
-                allUsers.forEach(row => {
-                    if (row[1] && row[6]) userBadges[row[1]] = row[6];
-                });
-                
-                const ideas = allRows.map((row, index) => {
-                    if (!row || row.length === 0) return null;
-                    if (row[0] === 'Beküldő' || row[0] === 'Ki javasolta?') return null;
+                if (!reason) return res.status(400).json({ error: "Indoklás kötelező!" });
+                if (contentId === undefined || contentId === null) {
+                    return res.status(400).json({ error: "Hiányzó tartalom azonosító!" });
+                }
 
-                    const storedEmail = row[5] || '';
-                    const submitterName = row[0] || 'Névtelen';
-                    const isMine = storedEmail === userData.email;
+                const targets = {
+                    'Sör':     'user_beers',
+                    'Ital':    'user_drinks',
+                    'Ötlet':   'ideas',
+                    'Ajánlás': 'recommendations'
+                };
+                const table = targets[type];
+                if (!table) return res.status(400).json({ error: "Ismeretlen tartalom típus!" });
 
-                    let badge = '';
-                    if (submitterName !== 'Anonymous' && userBadges[storedEmail]) {
-                        badge = userBadges[storedEmail];
-                    }
+                const rows = must(await db().from(table)
+                    .select('user_email').eq('id', parseInt(contentId)).limit(1));
+                const foundEmail = rows && rows.length > 0 ? rows[0].user_email : null;
+                if (!foundEmail) {
+                    return res.status(404).json({ error: "A jelentett tartalom vagy felhasználó nem található." });
+                }
 
-                    // --- SZAVAZAT KEZELÉS ---
-                    const voteCount = parseInt(row[6]) || 0; // G oszlop
-                    let voters = [];
-                    try { if(row[7]) voters = JSON.parse(row[7]); } catch(e){} // H oszlop
-                    const hasVoted = voters.includes(userData.email);
+                must(await db().from('reports').insert([{
+                    date_text: new Date().toLocaleString('hu-HU'),
+                    reporter_email: userData.email,
+                    content_type: type,
+                    content_id: String(contentId),
+                    reported_email: foundEmail,
+                    reason,
+                    status: 'Nyitott'
+                }]));
 
-                    return {
-                        index: index,
-                        submitter: submitterName,
-                        idea: row[1] || 'Nincs szöveg',
-                        timestamp: row[2] || '',
-                        status: row[3] || 'Megcsinálásra vár',
-                        date: row[4] || '',
-                        email: userData.isAdmin ? storedEmail : undefined,
-                        isMine: isMine,
-                        badge: badge,
-                        voteCount: voteCount, // ÚJ
-                        hasVoted: hasVoted    // ÚJ
-                    };
-                }).filter(item => item !== null);
-
-                // RENDEZÉS: Legtöbb szavazat elöl
-                ideas.sort((a, b) => b.voteCount - a.voteCount);
-
-                return res.status(200).json(ideas);
+                return res.status(200).json({ message: "Jelentés elküldve a moderátoroknak. Köszönjük az éberséget! 🛡️" });
             }
-            
-            case 'UPDATE_IDEA_STATUS': {
+
+            case 'GET_MODERATION_TASKS': {
                 const userData = verifyUser(req);
                 if (!userData.isAdmin) return res.status(403).json({ error: "Nincs jogosultságod ehhez a művelethez. 🚫" });
-                const { index, newStatus } = req.body;
-                
-                // Biztonsági ellenőrzés
-                if (index === undefined || index === null) {
-                    return res.status(400).json({ error: "Hiányzó index!" });
-                }
-                
-                // Mivel a Google Sheets sorai 1-től kezdődnek, a tömb indexe pedig 0-tól,
-                // és a map-elésnél az eredeti tömbindexet mentettük el:
-                // Tömb index 0 = Sheet 1. sor (Fejléc)
-                // Tömb index 1 = Sheet 2. sor (Első adat)
-                // Tehát a helyes sor a Sheet-ben: index + 1
-                
-                const rowIndex = parseInt(index) + 1;
-                const range = `${IDEAS_SHEET}!D${rowIndex}`; // D oszlop a Státusz
-                
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: range,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: [[newStatus]] }
-                });
-                
-                return res.status(200).json({ message: "Státusz sikeresen frissítve! ✅" });
+
+                const rows = must(await db().from('reports')
+                    .select('*').neq('status', 'Lezárva').order('id', { ascending: true }));
+
+                const reports = (rows || []).map(r => ({
+                    index: r.id,
+                    date: r.date_text,
+                    reporter: r.reporter_email,
+                    type: r.content_type,
+                    content: r.content_id,
+                    reportedUser: r.reported_email,
+                    reason: r.reason,
+                    status: r.status
+                })).reverse();
+
+                return res.status(200).json(reports);
             }
-            case 'ADD_RECOMMENDATION': {
+
+            case 'WARN_USER': {
                 const userData = verifyUser(req);
-                // Bővítettük: category paraméter is jön
-                const { itemName, itemType, category, description, isAnonymous } = req.body;
+                if (!userData.isAdmin) return res.status(403).json({ error: "Nincs jogosultságod ehhez a művelethez. 🚫" });
+                const { targetEmail, reportIndex } = req.body;
 
-                if (!itemName || !itemType) return res.status(400).json({ error: "Név és típus kötelező!" });
-                const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
-                
-                // Oszlopok: A:Dátum, B:Név, C:Email, D:Tétel, E:Típus, F:Leírás, G:Anonim, H:Kategória, I:Módosítva
-                const newRow = [
-                    timestamp,
-                    userData.name,
-                    userData.email,
-                    itemName,
-                    itemType,
-                    description || '',
-                    isAnonymous ? 'TRUE' : 'FALSE',
-                    category || 'Egyéb', // H oszlop: Kategória
-                    'FALSE'              // I oszlop: Módosítva (alapból nem)
-                ];
+                const rows = must(await db().from('users')
+                    .select('id,warnings').eq('email', targetEmail).limit(1));
+                if (!rows || rows.length === 0) return res.status(404).json({ error: "Felhasználó nem található." });
 
-                // A range-et bővítettük A:I-re
-                await sheets.spreadsheets.values.append({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `${RECOMMENDATIONS_SHEET}!A:I`,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: [newRow] }
-                });
+                let warnings = asArray(rows[0].warnings);
 
-                return res.status(201).json({ message: "Ajánlás sikeresen beküldve! 📢" });
+                // Fél évnél régebbi figyelmeztetések elévülnek
+                const sixMonthsAgo = new Date();
+                sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+                warnings = warnings.filter(w => new Date(w.date) > sixMonthsAgo);
+                warnings.push({ date: new Date().toISOString(), reason: "Admin által jóváhagyott jelentés" });
+
+                const isBanned = warnings.length >= 2;
+                const message = isBanned
+                    ? "Figyelmeztetés kiadva. A felhasználó automatikusan KITILTÁSRA került (2/2). 🚫"
+                    : "Figyelmeztetés kiadva.";
+
+                must(await db().from('users')
+                    .update({ warnings, is_banned: isBanned }).eq('id', rows[0].id));
+
+                if (reportIndex !== undefined && reportIndex !== null) {
+                    await db().from('reports')
+                        .update({ status: 'Lezárva (Büntetve)' }).eq('id', parseInt(reportIndex));
+                }
+
+                return res.status(200).json({ message, activeWarnings: warnings.length });
             }
 
-            case 'GET_RECOMMENDATIONS': {
-                const userData = verifyUser(req);
-                // Bővítettük A:K-ra (J=Count, K=Voters)
-                const recResponse = await sheets.spreadsheets.values.get({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `${RECOMMENDATIONS_SHEET}!A:K`
-                });
-                const usersResponse = await sheets.spreadsheets.values.get({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `${USERS_SHEET}!A:G`
-                });
+            // ==========================================================
+            // === FIÓK TÖRLÉSE (GDPR) ===
+            // Korábban: 18 Sheets-művelet, hat lap kiürítése és visszaírása.
+            // Most: néhány célzott törlés; az idegen kulcsok a kapcsolódó
+            // sorokat maguktól viszik (sql/02_constraints.sql).
+            // ==========================================================
 
-                const allRows = recResponse.data.values || [];
-                const allUsers = usersResponse.data.values || [];
-                
-                const userBadges = {};
-                allUsers.forEach(row => {
-                    if (row[1] && row[6]) userBadges[row[1]] = row[6];
-                });
-
-                const recommendations = allRows.map((row, index) => {
-                    if (index === 0) return null; 
-                    if (!row || row.length === 0) return null;
-
-                    const isAnon = row[6] === 'TRUE';
-                    const email = row[2];
-                    
-                    let displayName = isAnon ? 'Anonymus 🕵️' : (row[1] || 'Ismeretlen');
-                    let displayBadge = isAnon ? '' : (userBadges[email] || '');
-                    const isMine = (email === userData.email);
-
-                    // --- SZAVAZAT KEZELÉS ---
-                    const voteCount = parseInt(row[9]) || 0; // J oszlop
-                    let voters = [];
-                    try { if(row[10]) voters = JSON.parse(row[10]); } catch(e){} // K oszlop
-                    const hasVoted = voters.includes(userData.email);
-
-                    return {
-                        originalIndex: index,
-                        date: row[0] ? row[0].substring(0, 10) : '',
-                        submitter: displayName,
-                        badge: displayBadge,
-                        itemName: row[3],
-                        type: row[4],
-                        description: row[5] || '',
-                        isAnon: isAnon,
-                        category: row[7] || 'Egyéb',
-                        isEdited: row[8] === 'TRUE',
-                        isMine: isMine,
-                        voteCount: voteCount, // ÚJ
-                        hasVoted: hasVoted    // ÚJ
-                    };
-                }).filter(item => item !== null);
-
-                // RENDEZÉS: Legtöbb szavazat elöl
-                recommendations.sort((a, b) => b.voteCount - a.voteCount);
-
-                return res.status(200).json(recommendations);
-            }
-
-            // === SZAVAZÁS KEZELÉSE ===
-            case 'VOTE_CONTENT': {
-                const userData = verifyUser(req);
-                const { type, index, isUpvote } = req.body; // type: 'idea' vagy 'recommendation'
-
-                let sheetName = '';
-                let countCol = '';
-                let votersCol = '';
-                
-                // Melyik munkalapon dolgozunk?
-                if (type === 'idea') {
-                    sheetName = IDEAS_SHEET;
-                    countCol = 'G'; // 6. index
-                    votersCol = 'H'; // 7. index
-                } else if (type === 'recommendation') {
-                    sheetName = RECOMMENDATIONS_SHEET;
-                    countCol = 'J'; // 9. index
-                    votersCol = 'K'; // 10. index
-                } else {
-                    return res.status(400).json({ error: "Ismeretlen típus" });
-                }
-
-                // Az index a Sheetben (Frontend index + fejléc miatti eltolás)
-                // Ideas: tömb index = sheet sor index (mivel a map indexet használjuk)
-                // De a sheet API sorai 1-től kezdődnek.
-                // A 'GET' logikádban az `originalIndex` a tömb indexe (ami a teljes sheet.values tömb indexe).
-                // Tehát Sheet Sor = index + 1.
-                const rowIndex = parseInt(index) + 1;
-
-                // 1. Lekérjük a jelenlegi szavazatokat
-                const range = `${sheetName}!${countCol}${rowIndex}:${votersCol}${rowIndex}`;
-                const rowRes = await sheets.spreadsheets.values.get({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: range
-                });
-
-                const rowData = rowRes.data.values ? rowRes.data.values[0] : [0, "[]"];
-                let currentCount = parseInt(rowData[0]) || 0;
-                let voters = [];
-                try { voters = JSON.parse(rowData[1] || "[]"); } catch(e) {}
-
-                // 2. Logika: Hozzáadás vagy Elvétel
-                const userEmail = userData.email;
-                
-                if (voters.includes(userEmail)) {
-                    // Már szavazott -> visszavonjuk (toggle off)
-                    voters = voters.filter(e => e !== userEmail);
-                    currentCount = Math.max(0, currentCount - 1);
-                } else {
-                    // Még nem szavazott -> hozzáadjuk
-                    voters.push(userEmail);
-                    currentCount++;
-                }
-
-                // 3. Mentés
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: range,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: [[currentCount, JSON.stringify(voters)]] }
-                });
-
-                return res.status(200).json({ 
-                    message: "Szavazat rögzítve", 
-                    newCount: currentCount,
-                    voted: voters.includes(userEmail)
-                });
-            }
-
-            case 'EDIT_RECOMMENDATION': {
-                const userData = verifyUser(req);
-                const { originalIndex, itemName, itemType, category, description, isAnonymous } = req.body;
-                
-                // 1. Lekérjük az adott sort ellenőrzésre
-                // A sheet sor indexe: originalIndex + 1 (mert a tömb 0-tól indul, sheet 1-től)
-                const rowIndex = parseInt(originalIndex) + 1;
-                const rangeCheck = `${RECOMMENDATIONS_SHEET}!C${rowIndex}`; // C oszlop az Email
-                
-                const checkResponse = await sheets.spreadsheets.values.get({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: rangeCheck
-                });
-                
-                const ownerEmail = checkResponse.data.values ? checkResponse.data.values[0][0] : null;
-
-                // Biztonsági ellenőrzés: Csak a sajátját szerkesztheti!
-                if (ownerEmail !== userData.email) {
-                    return res.status(403).json({ error: "Csak a saját ajánlásodat módosíthatod!" });
-                }
-
-                // 2. Frissítés
-                // Oszlopok, amiket írunk: D(ItemName), E(Type), F(Desc), G(Anon), H(Cat), I(Edited)
-                const updateRange = `${RECOMMENDATIONS_SHEET}!D${rowIndex}:I${rowIndex}`;
-                const newValues = [
-                    itemName,
-                    itemType,
-                    description,
-                    isAnonymous ? 'TRUE' : 'FALSE',
-                    category,
-                    'TRUE' // I oszlop: Módosítva flag BEÁLLÍTÁSA
-                ];
-
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: updateRange,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: [newValues] }
-                });
-
-                return res.status(200).json({ message: "Ajánlás sikeresen módosítva!" });
-            }
-
-                 // === TÖRLÉSI FUNKCIÓK ===
-                
-                case 'DELETE_USER_BEER': {
-                    const userData = verifyUser(req);
-                    const { index } = req.body;
-                    
-                    const beersResponse = await sheets.spreadsheets.values.get({ 
-                        spreadsheetId: SPREADSHEET_ID, 
-                        range: GUEST_BEERS_SHEET 
-                    });
-                    
-                    const allRows = beersResponse.data.values || [];
-                    const userRows = allRows.filter(row => row[13] === userData.email);
-                    
-                    if (index < 0 || index >= userRows.length) {
-                        return res.status(400).json({ error: "Érvénytelen index" });
-                    }
-                    
-                    const targetRow = userRows[index];
-                    const globalIndex = allRows.indexOf(targetRow);
-                    
-                    // Töröljük a sort: minden sor marad, kivéve a célt
-                    const cleanRows = allRows.filter((_, idx) => idx !== globalIndex);
-                    
-                    // Frissítjük a Sheet-et
-                    await sheets.spreadsheets.values.clear({ 
-                        spreadsheetId: SPREADSHEET_ID, 
-                        range: GUEST_BEERS_SHEET 
-                    });
-                    
-                    if (cleanRows.length > 0) {
-                        await sheets.spreadsheets.values.update({
-                            spreadsheetId: SPREADSHEET_ID,
-                            range: GUEST_BEERS_SHEET,
-                            valueInputOption: 'USER_ENTERED',
-                            resource: { values: cleanRows }
-                        });
-                    }
-                    
-                    return res.status(200).json({ message: "Sör sikeresen törölve!" });
-                }
-                
-                case 'DELETE_USER_DRINK': {
-                    const userData = verifyUser(req);
-                    const { index } = req.body;
-                    
-                    const drinksResponse = await sheets.spreadsheets.values.get({ 
-                        spreadsheetId: SPREADSHEET_ID, 
-                        range: GUEST_DRINKS_SHEET 
-                    });
-                    
-                    const allRows = drinksResponse.data.values || [];
-                    const userRows = allRows.filter(row => row[13] === userData.email);
-                    
-                    if (index < 0 || index >= userRows.length) {
-                        return res.status(400).json({ error: "Érvénytelen index" });
-                    }
-                    
-                    const targetRow = userRows[index];
-                    const globalIndex = allRows.indexOf(targetRow);
-                    
-                    const cleanRows = allRows.filter((_, idx) => idx !== globalIndex);
-                    
-                    await sheets.spreadsheets.values.clear({ 
-                        spreadsheetId: SPREADSHEET_ID, 
-                        range: GUEST_DRINKS_SHEET 
-                    });
-                    
-                    if (cleanRows.length > 0) {
-                        await sheets.spreadsheets.values.update({
-                            spreadsheetId: SPREADSHEET_ID,
-                            range: GUEST_DRINKS_SHEET,
-                            valueInputOption: 'USER_ENTERED',
-                            resource: { values: cleanRows }
-                        });
-                    }
-                    
-                    return res.status(200).json({ message: "Ital sikeresen törölve!" });
-                }
-                
-                case 'DELETE_USER_IDEA': {
-                    const userData = verifyUser(req);
-                    const { index } = req.body;
-                    
-                    // JAVÍTÁS: A:H tartományt kérünk le, hogy a szavazatok (G, H) is benne legyenek!
-                    const ideasResponse = await sheets.spreadsheets.values.get({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: `${IDEAS_SHEET}!A:H` 
-                    });
-                    
-                    const allRows = ideasResponse.data.values || [];
-                    
-                    // Csak azokat az ötleteket nézzük, amik a useré ÉS még nem készek
-                    const userPendingIdeas = allRows
-                        .map((row, idx) => ({ row, originalIndex: idx }))
-                        .filter(item => {
-                            if (item.originalIndex === 0) return false; // Fejléc
-                            const row = item.row;
-                            return row[5] === userData.email && row[3] !== 'Megcsinálva';
-                        });
-                    
-                    if (index < 0 || index >= userPendingIdeas.length) {
-                        return res.status(400).json({ error: "Érvénytelen index vagy már nem törölhető!" });
-                    }
-                    
-                    const targetOriginalIndex = userPendingIdeas[index].originalIndex;
-                    const cleanRows = allRows.filter((_, idx) => idx !== targetOriginalIndex);
-                    
-                    // JAVÍTÁS: A teljes tartományt (A:H) töröljük és írjuk vissza
-                    await sheets.spreadsheets.values.clear({ 
-                        spreadsheetId: SPREADSHEET_ID, 
-                        range: `${IDEAS_SHEET}!A:H` 
-                    });
-                    
-                    if (cleanRows.length > 0) {
-                        await sheets.spreadsheets.values.update({
-                            spreadsheetId: SPREADSHEET_ID,
-                            range: `${IDEAS_SHEET}!A:H`,
-                            valueInputOption: 'USER_ENTERED',
-                            resource: { values: cleanRows }
-                        });
-                    }
-                    
-                    return res.status(200).json({ message: "Ötlet és a hozzá tartozó szavazatok sikeresen törölve!" });
-                }
-                
-                case 'DELETE_USER_RECOMMENDATION': {
-                    const userData = verifyUser(req);
-                    const { originalIndex } = req.body;
-                    
-                    // Ellenőrizzük, hogy a sajátja-e
-                    // Itt is fontos a sorindex korrekció (+1)
-                    const rowIndex = parseInt(originalIndex) + 1;
-                    const rangeCheck = `${RECOMMENDATIONS_SHEET}!C${rowIndex}`;
-                    
-                    const checkResponse = await sheets.spreadsheets.values.get({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: rangeCheck
-                    });
-                    
-                    const ownerEmail = checkResponse.data.values ? checkResponse.data.values[0][0] : null;
-                    
-                    if (ownerEmail !== userData.email) {
-                        return res.status(403).json({ error: "Csak a saját ajánlásodat törölheted!" });
-                    }
-                    
-                    // JAVÍTÁS: A:K tartományt kérünk le (J=Count, K=Voters)
-                    const recResponse = await sheets.spreadsheets.values.get({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: `${RECOMMENDATIONS_SHEET}!A:K`
-                    });
-                    
-                    const allRows = recResponse.data.values || [];
-                    const cleanRows = allRows.filter((_, idx) => idx !== originalIndex);
-                    
-                    // JAVÍTÁS: Teljes törlés és visszaírás A:K tartományban
-                    await sheets.spreadsheets.values.clear({ 
-                        spreadsheetId: SPREADSHEET_ID, 
-                        range: `${RECOMMENDATIONS_SHEET}!A:K` 
-                    });
-                    
-                    if (cleanRows.length > 0) {
-                        await sheets.spreadsheets.values.update({
-                            spreadsheetId: SPREADSHEET_ID,
-                            range: `${RECOMMENDATIONS_SHEET}!A:K`,
-                            valueInputOption: 'USER_ENTERED',
-                            resource: { values: cleanRows }
-                        });
-                    }
-                    
-                    return res.status(200).json({ message: "Ajánlás és a hozzá tartozó szavazatok sikeresen törölve!" });
-                }
-            case 'ADD_CONSUMPTION': {
-            const userData = verifyUser(req);
-            const { beerName, beerId, qty, dlPerGlass, totalDl, abv } = req.body;
-            const beersResponse = await sheets.spreadsheets.values.get({
-                spreadsheetId: SPREADSHEET_ID,
-                range: GUEST_BEERS_SHEET
-            });
-            const userOwnsThisBeer = (beersResponse.data.values || [])
-                .some(row => row[13] === userData.email && row[2] === beerName);
-        
-            if (!userOwnsThisBeer) {
-                return res.status(403).json({ error: "Ez a sör nem a te listádban szerepel." });
-            }
-            const newRow = [
-                new Date().toISOString().replace('T', ' ').substring(0, 19),
-                userData.email,
-                beerName,
-                beerId,
-                qty,
-                dlPerGlass,
-                totalDl,
-                abv
-            ];
-            await sheets.spreadsheets.values.append({
-                spreadsheetId: SPREADSHEET_ID,
-                range: 'Fogyasztás napló',
-                valueInputOption: 'USER_ENTERED',
-                resource: { values: [newRow] },
-            });
-            return res.status(201).json({ message: 'Fogyasztás rögzítve!' });
-        }
-        
-           case 'GET_CONSUMPTIONS': {
-          const userData = verifyUser(req);
-          const response = await sheets.spreadsheets.values.get({
-              spreadsheetId: SPREADSHEET_ID,
-              range: 'Fogyasztás napló!A:H'
-          });
-          const rows = response.data.values || [];
-          const userRows = rows.filter(r => r[1] === userData.email);
-          
-          const consMap = {};
-          userRows.forEach(r => {
-              const beerId = r[3];
-              if (!consMap[beerId]) consMap[beerId] = { count: 0, totalDl: 0 };
-              consMap[beerId].count  += parseInt(r[4]) || 0;
-              consMap[beerId].totalDl += parseInt(r[6]) || 0;
-          });
-      
-          // ✅ ÚJ: nyers bejegyzések is visszajönnek a grafikonokhoz
-          const entries = userRows.map(r => ({
-              date: r[0],
-              beerName: r[2],
-              beerId: r[3],
-              qty: parseInt(r[4]) || 0,
-              dlPerGlass: parseInt(r[5]) || 0,
-              totalDl: parseInt(r[6]) || 0,
-              abv: parseFloat(r[7]) || 0
-          }));
-      
-          return res.status(200).json({ map: consMap, entries });
-      }
-                      case 'IMPORT_USER_DATA': {
-    const userData = verifyUser(req);
-    const { beers, drinks } = req.body;
-
-    if ((!beers || beers.length === 0) && (!drinks || drinks.length === 0)) {
-        return res.status(400).json({ error: "Nincs importálható adat!" });
-    }
-
-    // ✅ ÚJ SEGÉDFÜGGVÉNY - Illeszd be IDE!
-    const normalizeDateToString = (date) => {
-        if (!date) return '';
-        
-        // Ha már string, visszaadjuk
-        if (typeof date === 'string') {
-            // Ha ISO formátum (pl. "2024-01-15T12:00:00")
-            if (date.includes('T')) {
-                return date.substring(0, 10);
-            }
-            // Ha magyar formátum (pl. "2024. 01. 15.")
-            if (date.includes('.')) {
-                const parts = date.split('.').map(p => p.trim()).filter(Boolean);
-                if (parts.length >= 3) {
-                    const year = parts[0].padStart(4, '0');
-                    const month = parts[1].padStart(2, '0');
-                    const day = parts[2].padStart(2, '0');
-                    return `${year}-${month}-${day}`;
-                }
-            }
-            return date.substring(0, 10);
-        }
-        
-        // Ha Date objektum
-        if (date instanceof Date) {
-            return date.toISOString().substring(0, 10);
-        }
-        
-        // Ha Excel serial number (pl. 44927)
-        if (typeof date === 'number') {
-            // Excel dátumok 1900-01-01-től számolnak (Windows)
-            const excelEpoch = new Date(1900, 0, 1);
-            const jsDate = new Date(excelEpoch.getTime() + (date - 2) * 86400000);
-            return jsDate.toISOString().substring(0, 10);
-        }
-        
-        return '';
-    };
-
-    try {
-        let addedBeersCount = 0;
-        let addedDrinksCount = 0;
-        let skippedCount = 0;
-
-        // --- SÖRÖK IMPORTÁLÁSA ---
-        if (beers && beers.length > 0) {
-            const existingBeersRes = await sheets.spreadsheets.values.get({ 
-                spreadsheetId: SPREADSHEET_ID, 
-                range: GUEST_BEERS_SHEET 
-            });
-            const existingRows = existingBeersRes.data.values || [];
-            const myExistingBeers = existingRows.filter(row => row[13] === userData.email);
-
-            // ✅ JAVÍTOTT createFingerprint
-            const createFingerprint = (date, name, type, score) => {
-                const d = normalizeDateToString(date); // ÚJ!
-                return `${d}|${name.trim().toLowerCase()}|${type.trim().toLowerCase()}|${score}`;
-            };
-
-            const existingFingerprints = new Set(myExistingBeers.map(row => 
-                createFingerprint(row[0], row[2], row[4], row[9])
-            ));
-
-            const newBeerRows = [];
-
-            beers.forEach(beer => {
-                const look = parseFloat(beer.look) || 0;
-                const smell = parseFloat(beer.smell) || 0;
-                const taste = parseFloat(beer.taste) || 0;
-                const totalScore = look + smell + taste;
-                const avgScore = (totalScore / 3).toFixed(2).replace('.', ',');
-                
-                // ✅ JAVÍTOTT dátum kezelés
-                const dateStr = beer.date 
-                    ? normalizeDateToString(beer.date) + ' 12:00:00' 
-                    : new Date().toISOString().replace('T', ' ').substring(0, 19);
-
-                const fingerprint = createFingerprint(dateStr, beer.beerName, beer.type || '', totalScore);
-
-                if (!existingFingerprints.has(fingerprint)) {
-                    newBeerRows.push([
-                        dateStr,
-                        userData.name,
-                        beer.beerName,
-                        beer.location || '',
-                        beer.type || '',
-                        look,
-                        smell,
-                        taste,
-                        beer.beerPercentage || 0,
-                        totalScore,
-                        avgScore,
-                        beer.notes || '',
-                        'Nem',
-                        userData.email
-                    ]);
-                    existingFingerprints.add(fingerprint);
-                    addedBeersCount++;
-                } else {
-                    skippedCount++;
-                }
-            });
-
-            if (newBeerRows.length > 0) {
-                await sheets.spreadsheets.values.append({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: GUEST_BEERS_SHEET,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: newBeerRows },
-                });
-            }
-        }
-
-        // --- ITALOK IMPORTÁLÁSA (UGYANÍGY JAVÍTVA) ---
-        if (drinks && drinks.length > 0) {
-            const existingDrinksRes = await sheets.spreadsheets.values.get({ 
-                spreadsheetId: SPREADSHEET_ID, 
-                range: GUEST_DRINKS_SHEET 
-            });
-            const existingRows = existingDrinksRes.data.values || [];
-            const myExistingDrinks = existingRows.filter(row => row[13] === userData.email);
-
-            // ✅ JAVÍTOTT createFingerprint italokhoz is
-            const createFingerprint = (date, name, cat, score) => {
-                const d = normalizeDateToString(date); // ÚJ!
-                return `${d}|${name.trim().toLowerCase()}|${cat.trim().toLowerCase()}|${score}`;
-            };
-
-            const existingFingerprints = new Set(myExistingDrinks.map(row => 
-                createFingerprint(row[0], row[2], row[3], row[10])
-            ));
-
-            const newDrinkRows = [];
-
-            drinks.forEach(drink => {
-                const look = parseFloat(drink.look) || 0;
-                const smell = parseFloat(drink.smell) || 0;
-                const taste = parseFloat(drink.taste) || 0;
-                const totalScore = look + smell + taste;
-                const avgScore = (totalScore / 3).toFixed(2).replace('.', ',');
-                
-                // ✅ JAVÍTOTT dátum kezelés
-                const dateStr = drink.date 
-                    ? normalizeDateToString(drink.date) + ' 12:00:00'
-                    : new Date().toISOString().replace('T', ' ').substring(0, 19);
-
-                const fingerprint = createFingerprint(dateStr, drink.drinkName, drink.category || 'Egyéb', totalScore);
-
-                if (!existingFingerprints.has(fingerprint)) {
-                    newDrinkRows.push([
-                        dateStr,
-                        userData.name,
-                        drink.drinkName,
-                        drink.category || 'Egyéb',
-                        drink.type || 'Alkoholos',
-                        drink.location || '',
-                        drink.drinkPercentage || 0,
-                        look,
-                        smell,
-                        taste,
-                        totalScore,
-                        avgScore,
-                        drink.notes || '',
-                        userData.email
-                    ]);
-                    existingFingerprints.add(fingerprint);
-                    addedDrinksCount++;
-                } else {
-                    skippedCount++;
-                }
-            });
-
-            if (newDrinkRows.length > 0) {
-                await sheets.spreadsheets.values.append({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: GUEST_DRINKS_SHEET,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: newDrinkRows },
-                });
-            }
-        }
-
-        return res.status(200).json({ 
-            message: `Sikeres importálás! (+${addedBeersCount} sör, +${addedDrinksCount} ital). ${skippedCount} duplikáció átugorva.` 
-        });
-
-    } catch (error) {
-        console.error("Import error:", error);
-        return res.status(500).json({ error: "Hiba az importálás során: " + error.message });
-    }
-}
-
-            case 'REFRESH_USER_DATA': {
-              const userData = verifyUser(req);
-              const usersResponse = await sheets.spreadsheets.values.get({ 
-                  spreadsheetId: SPREADSHEET_ID, 
-                  range: `Felhasználók!A:O` // Kiterjesztjük O-ig, ahol a settings van
-              });
-              const rows = usersResponse.data.values || [];
-              const userRow = rows.find(row => row[1] === userData.email);
-              
-              if (!userRow) return res.status(404).json({error: "User not found"});
-          
-              // Streak adatok
-              const currentStreak = parseInt(userRow[9]) || 0;
-              const longestStreak = parseInt(userRow[10]) || 0;
-              
-              // Achievementek
-              let achievements = { unlocked: [] };
-              try { if (userRow[5]) achievements = JSON.parse(userRow[5]); } catch(e){}
-
-              let settings = {};
-              try { if (userRow[14]) settings = JSON.parse(userRow[14]); } catch (e) {}
-          
-              return res.status(200).json({
-                  streak: { current: currentStreak, longest: longestStreak },
-                  achievements: achievements,
-                  badge: userRow[6] || '',
-                  settings: settings // Visszaküldjük a kliensnek
-              });
-          }
-
-          case 'SAVE_SETTINGS': {
-              const userData = verifyUser(req);
-              const { settings } = req.body; // Ez egy JSON objektum lesz
-          
-              if (!settings) return res.status(400).json({ error: "Nincs beállítás adat." });
-          
-              const usersResponse = await sheets.spreadsheets.values.get({ 
-                  spreadsheetId: SPREADSHEET_ID, 
-                  range: `${USERS_SHEET}!A:O` 
-              });
-              const rows = usersResponse.data.values || [];
-              const rowIndex = rows.findIndex(row => row[1] === userData.email);
-          
-              if (rowIndex === -1) return res.status(404).json({ error: "Felhasználó nem található." });
-          
-              // O oszlop frissítése (index 14)
-              // A sor indexe a Sheetben: rowIndex + 1
-              const updateRange = `${USERS_SHEET}!O${rowIndex + 1}`;
-          
-              await sheets.spreadsheets.values.update({
-                  spreadsheetId: SPREADSHEET_ID,
-                  range: updateRange,
-                  valueInputOption: 'USER_ENTERED',
-                  resource: { values: [[JSON.stringify(settings)]] }
-              });
-          
-              return res.status(200).json({ message: "Beállítások mentve." });
-          }
-                      
-            
             case 'DELETE_USER': {
                 const userData = verifyUser(req);
                 const userEmail = userData.email;
 
-                try {
-                    // --- 1. FELHASZNÁLÓ TÖRLÉSE ---
-                    const usersRes = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: USERS_SHEET });
-                    const allUsers = usersRes.data.values || [];
-                    const cleanUsers = allUsers.filter((row, index) => {
-                        if (index === 0) return true; 
-                        return row[1] !== userEmail; 
-                    });
-                    if (cleanUsers.length !== allUsers.length) {
-                        await sheets.spreadsheets.values.clear({ spreadsheetId: SPREADSHEET_ID, range: USERS_SHEET });
-                        await sheets.spreadsheets.values.update({
-                            spreadsheetId: SPREADSHEET_ID,
-                            range: USERS_SHEET,
-                            valueInputOption: 'USER_ENTERED',
-                            resource: { values: cleanUsers }
-                        });
+                // A leadott szavazatok visszavonása az ötletekről és ajánlásokról
+                for (const table of ['ideas', 'recommendations']) {
+                    const rows = must(await db().from(table).select('id,vote_count,voters'));
+                    for (const r of (rows || [])) {
+                        const voters = asArray(r.voters);
+                        if (!voters.includes(userEmail)) continue;
+                        must(await db().from(table).update({
+                            voters: voters.filter(e => e !== userEmail),
+                            vote_count: Math.max(0, (r.vote_count || 0) - 1)
+                        }).eq('id', r.id));
                     }
-
-                    // --- 2. SÖRÖK TÖRLÉSE ---
-                    const beersRes = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: GUEST_BEERS_SHEET });
-                    const allBeers = beersRes.data.values || [];
-                    const cleanBeers = allBeers.filter((row, index) => {
-                        if (index === 0) return true;
-                        return row[13] !== userEmail; 
-                    });
-                    if (cleanBeers.length !== allBeers.length) {
-                        await sheets.spreadsheets.values.clear({ spreadsheetId: SPREADSHEET_ID, range: GUEST_BEERS_SHEET });
-                        await sheets.spreadsheets.values.update({
-                            spreadsheetId: SPREADSHEET_ID,
-                            range: GUEST_BEERS_SHEET,
-                            valueInputOption: 'USER_ENTERED',
-                            resource: { values: cleanBeers }
-                        });
-                    }
-
-                    // --- 3. ITALOK TÖRLÉSE ---
-                    const drinksRes = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: GUEST_DRINKS_SHEET });
-                    const allDrinks = drinksRes.data.values || [];
-                    const cleanDrinks = allDrinks.filter((row, index) => {
-                        if (index === 0) return true;
-                        return row[13] !== userEmail;
-                    });
-                    if (cleanDrinks.length !== allDrinks.length) {
-                        await sheets.spreadsheets.values.clear({ spreadsheetId: SPREADSHEET_ID, range: GUEST_DRINKS_SHEET });
-                        await sheets.spreadsheets.values.update({
-                            spreadsheetId: SPREADSHEET_ID,
-                            range: GUEST_DRINKS_SHEET,
-                            valueInputOption: 'USER_ENTERED',
-                            resource: { values: cleanDrinks }
-                        });
-                    }
-                    
-                    // --- 4. ÖTLETEK TÖRLÉSE + SZAVAZATOK TISZTÍTÁSA ---
-                    const ideasRes = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: IDEAS_SHEET });
-                    const allIdeas = ideasRes.data.values || [];
-                    
-                    // Két dolgot csinálunk: 
-                    // 1. Kiszedjük a saját ötleteit.
-                    // 2. A maradékban megnézzük, szavazott-e, és ha igen, töröljük a szavazatát.
-                    const cleanIdeas = allIdeas.filter((row, index) => {
-                        if (index === 0) return true; // Fejléc marad
-                        return row[5] !== userEmail; // Saját ötlet törlése
-                    }).map((row, index) => {
-                        if (index === 0) return row; // Fejlécet ne bántsuk
-
-                        // Szavazatok tisztítása (G oszlop: Count, H oszlop: JSON)
-                        let count = parseInt(row[6]) || 0;
-                        let voters = [];
-                        try { if(row[7]) voters = JSON.parse(row[7]); } catch(e){}
-
-                        if (voters.includes(userEmail)) {
-                            // Ha szavazott, kivesszük
-                            voters = voters.filter(v => v !== userEmail);
-                            count = Math.max(0, count - 1);
-                            
-                            // Frissítjük a sort
-                            row[6] = count;
-                            row[7] = JSON.stringify(voters);
-                        }
-                        return row;
-                    });
-
-                    // Mindig frissítjük, mert lehet, hogy csak szavazatot töröltünk
-                    await sheets.spreadsheets.values.clear({ spreadsheetId: SPREADSHEET_ID, range: IDEAS_SHEET });
-                    await sheets.spreadsheets.values.update({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: IDEAS_SHEET,
-                        valueInputOption: 'USER_ENTERED',
-                        resource: { values: cleanIdeas }
-                    });
-                    
-
-                    // --- 5. AJÁNLÁSOK TÖRLÉSE + SZAVAZATOK TISZTÍTÁSA ---
-                    const recRes = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: RECOMMENDATIONS_SHEET });
-                    const allRecs = recRes.data.values || [];
-                    
-                    const cleanRecs = allRecs.filter((row, index) => {
-                        if (index === 0) return true;
-                        return row[2] !== userEmail; // C oszlop az email
-                    }).map((row, index) => {
-                        if (index === 0) return row;
-
-                        // Szavazatok tisztítása (J oszlop: Count, K oszlop: JSON)
-                        // Figyelem: indexek 0-tól -> J=9, K=10
-                        let count = parseInt(row[9]) || 0;
-                        let voters = [];
-                        try { if(row[10]) voters = JSON.parse(row[10]); } catch(e){}
-
-                        if (voters.includes(userEmail)) {
-                            voters = voters.filter(v => v !== userEmail);
-                            count = Math.max(0, count - 1);
-                            
-                            row[9] = count;
-                            row[10] = JSON.stringify(voters);
-                        }
-                        return row;
-                    });
-                    
-                    await sheets.spreadsheets.values.clear({ spreadsheetId: SPREADSHEET_ID, range: RECOMMENDATIONS_SHEET });
-                    await sheets.spreadsheets.values.update({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: RECOMMENDATIONS_SHEET,
-                        valueInputOption: 'USER_ENTERED',
-                        resource: { values: cleanRecs }
-                    });
-                    
-
-                    // --- 6. TOVÁBBI MUNKALAPOK TISZTÍTÁSA (teljes GDPR törlés) ---
-                    // A felhasználó e-mail címét tartalmazó sorok eltávolítása a fogyasztásnaplóból,
-                    // a hibajelentésekből, a moderációs jelentésekből és a nyertesek közül is.
-                    const purgeSheetByEmail = async (sheetName, emailColIndexes) => {
-                        try {
-                            const getRes = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: sheetName });
-                            const rows = getRes.data.values || [];
-                            if (rows.length === 0) return;
-                            const cleanRows = rows.filter(row => !emailColIndexes.some(ci => row[ci] === userEmail));
-                            if (cleanRows.length === rows.length) return; // nincs törölnivaló
-                            await sheets.spreadsheets.values.clear({ spreadsheetId: SPREADSHEET_ID, range: sheetName });
-                            if (cleanRows.length > 0) {
-                                await sheets.spreadsheets.values.update({
-                                    spreadsheetId: SPREADSHEET_ID,
-                                    range: sheetName,
-                                    valueInputOption: 'USER_ENTERED',
-                                    resource: { values: cleanRows }
-                                });
-                            }
-                        } catch (e) {
-                            console.error(`Purge hiba (${sheetName}):`, e);
-                        }
-                    };
-
-                    await purgeSheetByEmail('Fogyasztás napló', [1]); // B oszlop: e-mail
-                    await purgeSheetByEmail(SUPPORT_SHEET, [2]);       // Hibajelentések – C oszlop: e-mail
-                    await purgeSheetByEmail('Jelentések', [1, 4]);     // B: bejelentő, E: panaszolt fél
-                    await purgeSheetByEmail(WINNERS_SHEET, [2]);       // Nyertesek – C oszlop: e-mail
-                    await purgeSheetByEmail(BEERPONG_SHEET, [0]);
-
-                    return res.status(200).json({ message: "Fiók, adatok, ajánlások és leadott szavazatok sikeresen törölve." });
-                } catch (error) {
-                    console.error("Törlési hiba:", error);
-                    return res.status(500).json({ error: "Hiba történt a fiók törlése közben." });
                 }
+
+                // A felhasználóhoz kötött tartalmak
+                for (const table of ['user_beers', 'user_drinks', 'consumptions',
+                                     'beerpong_records', 'ideas', 'recommendations',
+                                     'support_tickets', 'winners']) {
+                    await db().from(table).delete().eq('user_email', userEmail);
+                }
+
+                // Jelentések: bejelentőként és bejelentettként is
+                await db().from('reports').delete().eq('reporter_email', userEmail);
+                await db().from('reports').delete().eq('reported_email', userEmail);
+
+                // Végül maga a fiók
+                must(await db().from('users').delete().eq('email', userEmail));
+
+                return res.status(200).json({
+                    message: "Fiók, adatok, ajánlások és leadott szavazatok sikeresen törölve."
+                });
             }
-            // === GOOGLE LOGIN ÉS REGISZTRÁCIÓ ===
+
+            // ==========================================================
+            // === GOOGLE BELÉPÉS / ÖSSZEKÖTÉS ===
+            // ==========================================================
+
             case 'GOOGLE_LOGIN': {
-                const { token: googleToken } = req.body;
-                // Ha nincs beállítva a Vercelen a változó, itt hiba lesz, de a logban látni fogod
-                const clientId = process.env.GOOGLE_CLIENT_ID; 
-                const client = new OAuth2Client(clientId);
-
-                const ticket = await client.verifyIdToken({
-                    idToken: googleToken,
-                    audience: clientId,
-                });
-                const payload = ticket.getPayload();
-                const googleEmail = payload.email;
-                const googleName = payload.name;
-                const googleSub = payload.sub; // Google ID
-
-                // Felhasználó keresése
-                // FONTOS: Feltételezzük, hogy az 'L' oszlop (index 11) tárolja a Google ID-t.
-                // Ha a te táblázatodban máshol van hely, írd át az indexeket!
-                const usersResponse = await sheets.spreadsheets.values.get({ 
-                    spreadsheetId: SPREADSHEET_ID, 
-                    range: `${USERS_SHEET}!A:O` 
-                });
-                
-                const rows = usersResponse.data.values || [];
-                let rowIndex = rows.findIndex(row => row[1] === googleEmail); // 1-es index az email
-                let userRow;
-                let isNewUser = false;
-
-                // Ha NINCS ilyen email -> Regisztráció
-                if (rowIndex === -1) {
-                    isNewUser = true;
-                    // Generálunk random jelszót és recovery kódot, mert Google-lel lép be
-                    const hashedPassword = await bcrypt.hash(Math.random().toString(36), 10); 
-                    const recoveryCode = Math.random().toString(36).slice(-8).toUpperCase();
-                    const hashedRecovery = await bcrypt.hash(recoveryCode, 10);
-                    const defaultAchievements = { unlocked: [] };
-
-                    // Új sor: A-tól L-ig (12 oszlop)
-                    // Figyelj a sorrendre, ez a te sheeted struktúrája alapján van:
-                    // Név, Email, Jelszó, 2FA Secret, 2FA Enabled, Achievements, Badge, RecoveryHash, LastActive, StreakCurr, StreakLong, GOOGLE_ID
-                    const newRow = [
-                        googleName, 
-                        googleEmail, 
-                        hashedPassword, 
-                        '', 
-                        'FALSE', 
-                        JSON.stringify(defaultAchievements), 
-                        '', 
-                        hashedRecovery, 
-                        '', 
-                        '0', 
-                        '0', 
-                        googleSub // L oszlop
-                    ];
-
-                    await sheets.spreadsheets.values.append({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: USERS_SHEET,
-                        valueInputOption: 'USER_ENTERED',
-                        resource: { values: [newRow] },
-                    });
-                    
-                    userRow = newRow;
-                } else {
-                    // Ha VAN ilyen email -> Belépés és esetleges összekötés
-                    userRow = rows[rowIndex];
-
-                    if (userRow[13] === 'TRUE') {
-                    return res.status(403).json({ error: "A fiókod fel lett függesztve a szabályzat megsértése miatt. 🚫" });
-                    }
-                    
-                    // Ha még nincs beírva a Google ID az L oszlopba, pótoljuk
-                    if (!userRow[11]) {
-                        const updateRange = `${USERS_SHEET}!L${rowIndex + 1}`;
-                        await sheets.spreadsheets.values.update({
-                            spreadsheetId: SPREADSHEET_ID,
-                            range: updateRange,
-                            valueInputOption: 'USER_ENTERED',
-                            resource: { values: [[googleSub]] }
-                        });
-                    }
-                }
-
-                // User objektum összeállítása a frontendnek
-                let achievements = { unlocked: [] };
-                try { if (userRow[5]) achievements = JSON.parse(userRow[5]); } catch(e){}
-              
-                let settings = {};
-                try { if (userRow[14]) settings = JSON.parse(userRow[14]); } catch (e) {}
-
-                const user = { 
-                    name: userRow[0], 
-                    email: userRow[1], 
-                    has2FA: userRow[4] === 'TRUE',
-                    achievements: achievements,
-                    badge: userRow[6] || '',
-                    streak: { current: parseInt(userRow[9])||0, longest: parseInt(userRow[10])||0 },
-                    isGoogleLinked: true,
-                    settings: settings
-                };
-
-                const token = jwt.sign(user, JWT_SECRET, { expiresIn: '1d' });
-                return res.status(200).json({ token, user, isNewUser });
-            }
-
-            // === FIÓK ÖSSZEKÖTÉS (BEÁLLÍTÁSOK) ===
-            case 'LINK_GOOGLE_ACCOUNT': {
-                const userData = verifyUser(req); // Ellenőrizzük a sima tokent
                 const { token: googleToken } = req.body;
                 const clientId = process.env.GOOGLE_CLIENT_ID;
                 const client = new OAuth2Client(clientId);
 
-                const ticket = await client.verifyIdToken({
-                    idToken: googleToken,
-                    audience: clientId,
-                });
+                const ticket = await client.verifyIdToken({ idToken: googleToken, audience: clientId });
+                const payload = ticket.getPayload();
+                const googleEmail = payload.email;
+                const googleName = payload.name;
+                const googleSub = payload.sub;
+
+                let rows = must(await db().from('users').select('*').eq('email', googleEmail).limit(1));
+                let u;
+                let isNewUser = false;
+
+                if (!rows || rows.length === 0) {
+                    isNewUser = true;
+                    const inserted = must(await db().from('users').insert([{
+                        name: googleName,
+                        email: googleEmail,
+                        password_hash: await bcrypt.hash(Math.random().toString(36), 10),
+                        twofa_secret: '', twofa_enabled: false,
+                        achievements: { unlocked: [] },
+                        badge: '',
+                        recovery_hash: await bcrypt.hash(Math.random().toString(36).slice(-8).toUpperCase(), 10),
+                        last_activity_week: '',
+                        current_streak: 0, longest_streak: 0,
+                        google_id: googleSub
+                    }]).select('*'));
+                    u = inserted[0];
+                } else {
+                    u = rows[0];
+                    if (u.is_banned) {
+                        return res.status(403).json({ error: "A fiókod fel lett függesztve a szabályzat megsértése miatt. 🚫" });
+                    }
+                    if (!u.google_id) {
+                        must(await db().from('users').update({ google_id: googleSub }).eq('id', u.id));
+                        u.google_id = googleSub;
+                    }
+                }
+
+                const user = toUserObject(u, !!u.twofa_enabled);
+                user.isGoogleLinked = true;
+                const token = jwt.sign(user, JWT_SECRET, { expiresIn: '1d' });
+                return res.status(200).json({ token, user, isNewUser });
+            }
+
+            case 'LINK_GOOGLE_ACCOUNT': {
+                const userData = verifyUser(req);
+                const { token: googleToken } = req.body;
+                const clientId = process.env.GOOGLE_CLIENT_ID;
+                const client = new OAuth2Client(clientId);
+
+                const ticket = await client.verifyIdToken({ idToken: googleToken, audience: clientId });
                 const { sub: googleSub } = ticket.getPayload();
 
-                const usersResponse = await sheets.spreadsheets.values.get({ 
-                    spreadsheetId: SPREADSHEET_ID, 
-                    range: `${USERS_SHEET}!A:L` 
-                });
-                const rows = usersResponse.data.values || [];
-                const rowIndex = rows.findIndex(row => row[1] === userData.email);
+                const taken = must(await db().from('users')
+                    .select('id').eq('google_id', googleSub).neq('email', userData.email).limit(1));
+                if (taken && taken.length > 0) {
+                    return res.status(409).json({ error: "Ez a Google fiók már foglalt!" });
+                }
 
-                if (rowIndex === -1) return res.status(404).json({ error: "Felhasználó nem található" });
-
-                // Ellenőrizzük, hogy más nem használja-e már ezt a Google fiókot
-                const isTaken = rows.some(row => row[11] === googleSub && row[1] !== userData.email);
-                if (isTaken) return res.status(409).json({ error: "Ez a Google fiók már foglalt!" });
-
-                // Mentés az L oszlopba
-                const updateRange = `${USERS_SHEET}!L${rowIndex + 1}`;
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: updateRange,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: [[googleSub]] }
-                });
+                const upd = must(await db().from('users')
+                    .update({ google_id: googleSub }).eq('email', userData.email).select('id'));
+                if (!upd || upd.length === 0) return res.status(404).json({ error: "Felhasználó nem található" });
 
                 return res.status(200).json({ message: "Sikeres összekötés! 🎉" });
             }
 
-            // === KAPCSOLAT BONTÁSA ===
             case 'UNLINK_GOOGLE_ACCOUNT': {
                 const userData = verifyUser(req);
-                
-                const usersResponse = await sheets.spreadsheets.values.get({ 
-                    spreadsheetId: SPREADSHEET_ID, 
-                    range: `${USERS_SHEET}!A:L` 
-                });
-                const rows = usersResponse.data.values || [];
-                const rowIndex = rows.findIndex(row => row[1] === userData.email);
-                
-                if (rowIndex === -1) return res.status(404).json({ error: "Felhasználó nem található" });
 
-                // Ellenőrzés: Csak akkor engedjük leválasztani, ha az L oszlopban van adat
-                if (!rows[rowIndex][11]) {
-                     return res.status(400).json({ error: "Nincs Google fiók összekötve!" });
-                }
+                const rows = must(await db().from('users')
+                    .select('id,google_id').eq('email', userData.email).limit(1));
+                if (!rows || rows.length === 0) return res.status(404).json({ error: "Felhasználó nem található" });
+                if (!rows[0].google_id) return res.status(400).json({ error: "Nincs Google fiók összekötve!" });
 
-                // Törlés az L oszlopból
-                const updateRange = `${USERS_SHEET}!L${rowIndex + 1}`;
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: updateRange,
-                    valueInputOption: 'USER_ENTERED',
-                    resource: { values: [['']] } // Üres stringgel felülírjuk
-                });
-
+                must(await db().from('users').update({ google_id: '' }).eq('id', rows[0].id));
                 return res.status(200).json({ message: "Google fiók kapcsolat sikeresen bontva! 🔌" });
             }
 
-            // === TOPLISTA (csak a publikus profilú felhasználók, e-mail cím nélkül) ===
+            // ==========================================================
+            // === TOPLISTA ===
+            // Korábban: három teljes munkalap letöltése minden kérésnél.
+            // Most: három szűkített, indexelt lekérdezés párhuzamosan.
+            // ==========================================================
+
             case 'GET_LEADERBOARD': {
                 const userData = verifyUser(req);
 
-                const [usersRes, beersRes, drinksRes] = await Promise.all([
-                    sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${USERS_SHEET}!A:O` }),
-                    sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: GUEST_BEERS_SHEET }),
-                    sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: GUEST_DRINKS_SHEET })
-                ]);
+                const [users, beerRows, drinkRows] = await Promise.all([
+                    db().from('users')
+                        .select('name,email,badge,achievements,current_streak,longest_streak,settings,is_banned')
+                        .eq('is_banned', false),
+                    db().from('user_beers').select('user_email,beer_name,type,location,avg,date_text'),
+                    db().from('user_drinks').select('user_email,drink_name,type,category,avg,date_text')
+                ]).then(r => r.map(must));
 
-                const ratingStats = buildRatingStats(beersRes.data.values || [], drinksRes.data.values || []);
+                const ratingStats = buildRatingStats(beerRows, drinkRows);
 
                 const leaderboard = [];
-                (usersRes.data.values || []).forEach(row => {
-                    const name = row[0];
-                    const email = row[1];
-                    if (!name || !email || !email.includes('@')) return; // fejléc / hibás sor kihagyása
-                    if (row[13] === 'TRUE') return; // kitiltott felhasználó nem szerepel
+                (users || []).forEach(u => {
+                    if (!u.name || !u.email || !u.email.includes('@')) return;
+                    if (!isProfilePublic(asObject(u.settings, {}))) return;
 
-                    const settings = parseUserSettings(row[14]);
-                    if (!isProfilePublic(settings)) return; // a felhasználó kikapcsolta a megjelenést
-
-                    const s = ratingStats[email];
+                    const s = ratingStats[u.email];
                     const totalCount = s ? s.beerCount + s.drinkCount : 0;
-                    if (totalCount === 0) return; // értékelés nélkül nincs helyezés
+                    if (totalCount === 0) return;
 
-                    let achievementCount = 0;
-                    try { achievementCount = (JSON.parse(row[5] || '{}').unlocked || []).length; } catch (e) {}
+                    const achievementCount = (asObject(u.achievements, {}).unlocked || []).length;
 
                     leaderboard.push({
-                        publicId: getPublicId(email, JWT_SECRET),
-                        name,
-                        badge: row[6] || '',
+                        publicId: getPublicId(u.email, JWT_SECRET),
+                        name: u.name,
+                        badge: u.badge || '',
                         beerCount: s.beerCount,
                         drinkCount: s.drinkCount,
                         totalCount,
                         avgScore: parseFloat((s.sumAvg / totalCount).toFixed(2)),
-                        currentStreak: parseInt(row[9]) || 0,
-                        longestStreak: parseInt(row[10]) || 0,
+                        currentStreak: u.current_streak || 0,
+                        longestStreak: u.longest_streak || 0,
                         achievementCount,
-                        isMe: email === userData.email
+                        isMe: u.email === userData.email
                     });
                 });
 
@@ -2541,40 +1454,37 @@ case 'EDIT_USER_DRINK': {
                 return res.status(200).json({ leaderboard });
             }
 
-            // === PUBLIKUS PROFIL MEGTEKINTÉSE (publicId alapján, e-mail cím nélkül) ===
+            // === PUBLIKUS PROFIL (publicId alapján, e-mail cím nélkül) ===
             case 'GET_PUBLIC_PROFILE': {
                 const userData = verifyUser(req);
                 const { publicId } = req.body;
                 if (!publicId) return res.status(400).json({ error: "Hiányzó profil azonosító." });
 
-                const usersRes = await sheets.spreadsheets.values.get({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `${USERS_SHEET}!A:O`
-                });
-                const rows = usersRes.data.values || [];
-                const userRow = rows.find(row =>
-                    row[1] && row[1].includes('@') && getPublicId(row[1], JWT_SECRET) === publicId
+                // A publicId az e-mail HMAC-ja, ezért visszafelé nem kereshető:
+                // végig kell néznünk a felhasználókat (kis tábla, indexelt olvasás).
+                const users = must(await db().from('users')
+                    .select('name,email,badge,achievements,current_streak,longest_streak,settings,is_banned'));
+
+                const u = (users || []).find(x =>
+                    x.email && x.email.includes('@') && getPublicId(x.email, JWT_SECRET) === publicId
                 );
 
-                if (!userRow || userRow[13] === 'TRUE') {
-                    return res.status(404).json({ error: "A profil nem található." });
-                }
+                if (!u || u.is_banned) return res.status(404).json({ error: "A profil nem található." });
 
-                const email = userRow[1];
+                const email = u.email;
                 const isMe = email === userData.email;
-                const settings = parseUserSettings(userRow[14]);
+                const settings = asObject(u.settings, {});
 
-                // Privát profilt csak a tulajdonosa nézheti meg (előnézetként)
                 if (!isProfilePublic(settings) && !isMe) {
                     return res.status(403).json({ error: "Ez a profil privát. 🔒" });
                 }
 
-                const [beersRes, drinksRes] = await Promise.all([
-                    sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: GUEST_BEERS_SHEET }),
-                    sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: GUEST_DRINKS_SHEET })
-                ]);
+                const [beerRows, drinkRows] = await Promise.all([
+                    db().from('user_beers').select('user_email,beer_name,type,location,avg,date_text').eq('user_email', email),
+                    db().from('user_drinks').select('user_email,drink_name,type,category,avg,date_text').eq('user_email', email)
+                ]).then(r => r.map(must));
 
-                const allStats = buildRatingStats(beersRes.data.values || [], drinksRes.data.values || []);
+                const allStats = buildRatingStats(beerRows, drinkRows);
                 const stats = allStats[email] || { beerCount: 0, drinkCount: 0, sumAvg: 0, beers: [], drinks: [], types: {}, locations: {}, firstDate: null };
 
                 const totalCount = stats.beerCount + stats.drinkCount;
@@ -2584,12 +1494,11 @@ case 'EDIT_USER_DRINK': {
                     return top ? top[0] : null;
                 };
 
-                let achievements = [];
-                try { achievements = JSON.parse(userRow[5] || '{}').unlocked || []; } catch (e) {}
+                const achievements = asObject(u.achievements, {}).unlocked || [];
 
                 return res.status(200).json({
-                    name: userRow[0],
-                    badge: userRow[6] || '',
+                    name: u.name,
+                    badge: u.badge || '',
                     isMe,
                     isPublic: isProfilePublic(settings),
                     stats: {
@@ -2599,8 +1508,8 @@ case 'EDIT_USER_DRINK': {
                         avgScore: totalCount > 0 ? parseFloat((stats.sumAvg / totalCount).toFixed(2)) : 0,
                         favType: favOf(stats.types),
                         favLocation: favOf(stats.locations),
-                        currentStreak: parseInt(userRow[9]) || 0,
-                        longestStreak: parseInt(userRow[10]) || 0,
+                        currentStreak: u.current_streak || 0,
+                        longestStreak: u.longest_streak || 0,
                         achievementCount: achievements.length,
                         firstDate: stats.firstDate ? String(stats.firstDate).substring(0, 10) : null
                     },
@@ -2609,41 +1518,23 @@ case 'EDIT_USER_DRINK': {
                 });
             }
 
-            // ======================================================
-            // === SÖRPONG JÁTÉK API ===
-            // A 'Sörpong' munkalap oszlopai:
-            // A: Email | B: Típus (roster/game/tournament) | C: ID | D: Dátum | E: Adat (JSON)
-            // Minden sor csak a saját tulajdonosának (email) érhető el,
-            // így a játékokat/toplistákat csak az látja, akinek a profilján indultak.
-            // ======================================================
+            // ==========================================================
+            // === SÖRPONG ===
+            // Minden rekord csak a tulajdonosáé (user_email).
+            // ==========================================================
 
             case 'BEERPONG_GET': {
                 const userData = verifyUser(req);
-
-                let rows = [];
-                try {
-                    const resp = await sheets.spreadsheets.values.get({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: `${BEERPONG_SHEET}!A:E`
-                    });
-                    rows = resp.data.values || [];
-                } catch (e) {
-                    // Ha a munkalap még nem létezik, érthető üzenetet adunk vissza
-                    return res.status(500).json({
-                        error: `A(z) '${BEERPONG_SHEET}' munkalap nem található! Hozd létre a Google Táblázatban (üresen is elég).`,
-                        missingSheet: true
-                    });
-                }
+                const rows = must(await db().from('beerpong_records')
+                    .select('type,payload').eq('user_email', userData.email).order('id', { ascending: true }));
 
                 const result = { roster: null, games: [], tournaments: [] };
-                rows.forEach(row => {
-                    if (!row || row[0] !== userData.email) return;
-                    let data = null;
-                    try { data = JSON.parse(row[4] || 'null'); } catch (e) { return; }
+                (rows || []).forEach(r => {
+                    const data = asObject(r.payload, null);
                     if (!data) return;
-                    if (row[1] === 'roster') result.roster = data;
-                    else if (row[1] === 'game') result.games.push(data);
-                    else if (row[1] === 'tournament') result.tournaments.push(data);
+                    if (r.type === 'roster') result.roster = data;
+                    else if (r.type === 'game') result.games.push(data);
+                    else if (r.type === 'tournament') result.tournaments.push(data);
                 });
 
                 return res.status(200).json(result);
@@ -2659,52 +1550,21 @@ case 'EDIT_USER_DRINK': {
                 if (!data || typeof data !== 'object') {
                     return res.status(400).json({ error: "Hiányzó vagy hibás adat!" });
                 }
-
-                const json = JSON.stringify(data);
-                // A Google Sheets cellánként max ~50.000 karaktert enged
-                if (json.length > 45000) {
+                if (JSON.stringify(data).length > 45000) {
                     return res.status(400).json({ error: "Túl nagy adat, nem menthető!" });
                 }
 
                 const recordId = String(id || (type === 'roster' ? 'roster' : Date.now()));
-                const dateStr = new Date().toISOString().replace('T', ' ').substring(0, 19);
-                const newRow = [userData.email, type, recordId, dateStr, json];
 
-                let rows = [];
-                try {
-                    const resp = await sheets.spreadsheets.values.get({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: `${BEERPONG_SHEET}!A:E`
-                    });
-                    rows = resp.data.values || [];
-                } catch (e) {
-                    return res.status(500).json({
-                        error: `A(z) '${BEERPONG_SHEET}' munkalap nem található! Hozd létre a Google Táblázatban (üresen is elég).`,
-                        missingSheet: true
-                    });
-                }
-
-                // UPSERT: ha már létezik ilyen sor (email + típus + id), frissítjük.
-                // Így az offline queue esetleges ismételt beküldése sem duplikál.
-                const rowIndex = rows.findIndex(row =>
-                    row && row[0] === userData.email && row[1] === type && String(row[2]) === recordId
-                );
-
-                if (rowIndex >= 0) {
-                    await sheets.spreadsheets.values.update({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: `${BEERPONG_SHEET}!A${rowIndex + 1}:E${rowIndex + 1}`,
-                        valueInputOption: 'RAW',
-                        resource: { values: [newRow] }
-                    });
-                } else {
-                    await sheets.spreadsheets.values.append({
-                        spreadsheetId: SPREADSHEET_ID,
-                        range: `${BEERPONG_SHEET}!A:E`,
-                        valueInputOption: 'RAW',
-                        resource: { values: [newRow] }
-                    });
-                }
+                // Az (user_email, record_id) egyedi megszorítás miatt az upsert
+                // az offline sor ismételt beküldésekor sem duplikál.
+                must(await db().from('beerpong_records').upsert([{
+                    user_email: userData.email,
+                    type,
+                    record_id: recordId,
+                    date_text: nowText(),
+                    payload: data
+                }], { onConflict: 'user_email,record_id' }));
 
                 return res.status(200).json({ message: "Sörpong adat mentve! 🏓", id: recordId });
             }
@@ -2717,38 +1577,30 @@ case 'EDIT_USER_DRINK': {
                     return res.status(400).json({ error: "Hiányzó vagy hibás törlési adatok!" });
                 }
 
-                const resp = await sheets.spreadsheets.values.get({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `${BEERPONG_SHEET}!A:E`
-                });
-                const rows = resp.data.values || [];
+                const del = must(await db().from('beerpong_records').delete()
+                    .eq('user_email', userData.email)
+                    .eq('type', type)
+                    .eq('record_id', String(id))
+                    .select('id'));
 
-                const rowIndex = rows.findIndex(row =>
-                    row && row[0] === userData.email && row[1] === type && String(row[2]) === String(id)
-                );
-
-                if (rowIndex === -1) {
+                if (!del || del.length === 0) {
                     return res.status(404).json({ error: "A törlendő elem nem található." });
                 }
-
-                // A sort nem töröljük fizikailag (ahhoz sheetId kellene),
-                // csak kiürítjük - az üres sorokat a lekérés átugorja.
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `${BEERPONG_SHEET}!A${rowIndex + 1}:E${rowIndex + 1}`,
-                    valueInputOption: 'RAW',
-                    resource: { values: [['', '', '', '', '']] }
-                });
 
                 return res.status(200).json({ message: "Sikeresen törölve! 🗑️" });
             }
 
             default:
                 return res.status(400).json({ error: "Ismeretlen művelet." });
-        } // Switch vége
+        }
 
     } catch (error) {
         console.error("API Hiba:", error);
+        // A lejárt/hibás tokent 401-gyel jelezzük, ahogy a frontend várja.
+        if (error && (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError'
+            || /authentikációs token/.test(error.message || ''))) {
+            return res.status(401).json({ error: "A munkameneted lejárt, kérlek jelentkezz be újra." });
+        }
         return res.status(500).json({ error: "Kritikus szerverhiba: " + error.message });
     }
-} // Handler vége
+}
