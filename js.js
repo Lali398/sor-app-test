@@ -1753,6 +1753,33 @@ function setupAdminRecap() {
     // === NÉZETVÁLTÁS ÉS ADATKEZELÉS ===
     // ======================================================
     
+    // A statisztika szöveges csempéi. Külön kezeljük az áttekintő és a
+    // fogyasztási csoportot: előbbit a hatókör-szűrő is nullázhatja, utóbbit
+    // viszont egy másik függvény tölti, azt csak kilépéskor szabad törölni.
+    const STAT_OVERVIEW_TILES = {
+        statTotalCount: '0', statTotalAvg: '0.00', statAvgAbv: '0.0%',
+        statHighScoreName: '-', statHighScoreVal: '-',
+        statStrongest: '-', statStrongestVal: '-',
+        statWeakest: '-', statWeakestVal: '-',
+        statBestLook: '-', statBestTaste: '-',
+        statTopLocation: '-', statTopLocationCount: '-'
+    };
+    const STAT_CONSUMPTION_TILES = { statConsGlasses: '0', statConsDl: '0', statConsUnits: '0.0' };
+
+    function applyStatTiles(tiles) {
+        Object.entries(tiles).forEach(([id, value]) => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = value;
+        });
+    }
+
+    function resetOverviewStatTiles() { applyStatTiles(STAT_OVERVIEW_TILES); }
+
+    function resetAllStatTiles() {
+        applyStatTiles(STAT_OVERVIEW_TILES);
+        applyStatTiles(STAT_CONSUMPTION_TILES);
+    }
+
     function switchToGuestView() {
         document.body.classList.remove('custom-cursor-active');
         
@@ -1790,6 +1817,10 @@ function setupAdminRecap() {
         }
         // A nyilvántartásukat is ürítjük, hogy ne maradjon eldobott példányra hivatkozás.
         if (typeof myStatsCharts !== 'undefined') myStatsCharts = {};
+
+        // A szöveges csempék (összes db, átlag, legerősebb, top hely, fogyasztás...)
+        // szintén a DOM-ban maradnának az előző fiók értékeivel.
+        resetAllStatTiles();
         
         // 3. UI elemek "takarítása"
         const achiGrid = document.getElementById('achievementsGrid');
@@ -6512,10 +6543,10 @@ if (typeof switchToUserView === 'function') {
         }
     
         if (dataset.length === 0) {
-            // Ha nincs adat, nullázzuk a kijelzőket
-            document.getElementById('statTotalCount').textContent = "0";
-            document.getElementById('statTotalAvg').textContent = "0.00";
-            document.getElementById('statAvgAbv').textContent = "0.0%";
+            // Ha nincs adat, MINDEN áttekintő kijelzőt nullázunk. Korábban csak
+            // három csempét, ezért a többi (legerősebb, top hely, legjobb íz...)
+            // megtartotta az előző adathalmaz értékét.
+            resetOverviewStatTiles();
             return;
         }
     
