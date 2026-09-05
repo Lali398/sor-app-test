@@ -1767,6 +1767,29 @@ function setupAdminRecap() {
         usersData = [];
         filteredBeers = [];
         allRecommendationsData = []; 
+
+        // 2/b. A MÁR KIRAJZOLT tartalom eltávolítása.
+        // A fenti tömbök nullázása csak a memóriát üríti; a táblák sorai a
+        // DOM-ban maradnak, amíg egy újrarenderelés felül nem írja őket.
+        // A söröknél ez a belépéskor megtörténik, az italoknál viszont csak
+        // a fül megnyitásakor - így profilváltás után az előző fiók italai
+        // látszottak tovább.
+        if (typeof userBeerTableBody !== 'undefined' && userBeerTableBody) userBeerTableBody.innerHTML = '';
+        if (typeof userDrinkTableBody !== 'undefined' && userDrinkTableBody) userDrinkTableBody.innerHTML = '';
+
+        // A személyes statisztika diagramjai a Chart.js példányaikban tartják
+        // az adatot, ezért külön el kell dobni oket.
+        if (typeof Chart !== 'undefined' && typeof Chart.getChart === 'function') {
+            ['statCategoryChart', 'statActivityChart', 'statDayChart', 'statRadarChart',
+             'statConsTopChart', 'statConsTrendChart', 'statConsScatterChart'].forEach(id => {
+                const canvas = document.getElementById(id);
+                if (!canvas) return;
+                const existing = Chart.getChart(canvas);
+                if (existing) existing.destroy();
+            });
+        }
+        // A nyilvántartásukat is ürítjük, hogy ne maradjon eldobott példányra hivatkozás.
+        if (typeof myStatsCharts !== 'undefined') myStatsCharts = {};
         
         // 3. UI elemek "takarítása"
         const achiGrid = document.getElementById('achievementsGrid');
